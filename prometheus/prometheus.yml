@@ -1,0 +1,38 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+  external_labels:
+    stack: jdblance-lb
+
+rule_files:
+  - /etc/prometheus/rules.yml
+
+scrape_configs:
+  # The load balancer's control plane.  With listen.workers > 1 each worker
+  # exposes its own port (admin.port + worker index), so add jdblance:8002,
+  # jdblance:8003 ... to this list when you scale up.
+  - job_name: jdblance
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["jdblance:8001"]
+        labels:
+          component: load_balancer
+
+  - job_name: backends
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - backend1:5000
+          - backend2:5000
+          - backend3:5000
+          - backend4:5000
+        labels:
+          component: origin
+    # Tailscale-connected origins go here; the 100.x addresses come from
+    # `tailscale ip -4` on each machine.
+    # - targets: ["100.119.221.6:5001", "100.119.221.6:5002"]
+    #   labels: {component: origin, site: remote}
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

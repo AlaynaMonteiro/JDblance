@@ -1,0 +1,11 @@
+.git
+.github
+.env
+build
+build-asan
+tests
+grafana
+prometheus
+nginx
+README.md
+*.log

@@ -1,0 +1,4 @@
+# Normalise text to LF, and keep it LF in working copies too: the Makefile and
+# tests/smoke.sh are run by make and bash (often under WSL from a Windows
+# checkout), and neither tolerates CRLF.
+* text=auto eol=lf

@@ -1,0 +1,89 @@
+# Alerting rules for the load balancer.
+#
+# Every rule here alerts on a *symptom a user can feel* rather than on a cause.
+# "A backend is down" is not an incident when the balancer routed around it in
+# 40 ms; "the error rate the client sees is 5%" always is.  That is the whole
+# argument of the Google SRE book's symptom-based alerting chapter, and it is
+# why `JDblanceBackendDown` is a warning while `JDblanceHighErrorRate` is a page.
+
+groups:
+  - name: jdblance
+    interval: 10s
+    rules:
+      - alert: JDblanceDown
+        expr: up{job="jdblance"} == 0
+        for: 30s
+        labels: {severity: critical}
+        annotations:
+          summary: "Load balancer is not being scraped"
+          description: "The proxy is unreachable or dead. Everything behind it is dark."
+
+      - alert: JDblanceHighErrorRate
+        expr: |
+          sum(rate(jdblance_requests_total{status=~"5.."}[2m]))
+            / clamp_min(sum(rate(jdblance_requests_total[2m])), 0.001) > 0.05
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "More than 5% of responses are 5xx"
+          description: "Clients are seeing errors even after retries and failover."
+
+      - alert: JDblanceNoHealthyUpstreams
+        expr: sum(jdblance_endpoint_up) == 0
+        for: 30s
+        labels: {severity: critical}
+        annotations:
+          summary: "No healthy upstreams"
+
+      - alert: JDblancePanicMode
+        expr: sum(jdblance_endpoint_up) / count(jdblance_endpoint_up) < 0.5
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "Fewer than half the endpoints are healthy"
+          description: "The balancer is in panic mode and ignoring health state."
+
+      - alert: JDblanceBackendDown
+        expr: jdblance_endpoint_up == 0
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: "Endpoint {{ $labels.endpoint }} is out of rotation"
+
+      - alert: JDblanceBreakerOpen
+        expr: jdblance_endpoint_breaker_state == 2
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: "Circuit breaker open for {{ $labels.endpoint }}"
+          description: "Ejected by passive failure detection, not by health checks."
+
+      - alert: JDblanceSheddingLoad
+        expr: sum(rate(jdblance_shed_total[2m])) > 1
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: "Requests are being shed"
+          description: >-
+            Admission control is refusing traffic. Working as designed under a
+            spike; a capacity problem if it persists.
+
+      - alert: JDblanceLatencyRegression
+        expr: |
+          histogram_quantile(
+            0.99, sum(rate(jdblance_request_duration_seconds_bucket[5m])) by (le)
+          ) > 1
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "p99 latency above 1s for 5 minutes"
+
+      - alert: JDblanceRetryStorm
+        expr: |
+          sum(rate(jdblance_retries_total[2m]))
+            / clamp_min(sum(rate(jdblance_requests_total[2m])), 0.001) > 0.2
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: "Over 20% of traffic is retries"
+          description: "The retry budget is close to saturated; the fleet is struggling."

@@ -1,0 +1,128 @@
+{
+  // JDblance load balancer -- every key here has a production-safe default,
+  // so anything you delete keeps working.  ${VAR:-default} reads the env.
+
+  "listen": {
+    "host": "0.0.0.0",
+    "port": 8000,
+    "backlog": 2048,
+    // One worker process per core on Linux (SO_REUSEPORT sharding).
+    // Each worker exposes its own control plane on admin.port + worker index.
+    "workers": ${JDBLANCE_WORKERS:-1},
+    "reuse_port": true
+  },
+
+  "admin": {
+    "host": "0.0.0.0",
+    "port": 8001,
+    "enabled": true
+  },
+
+  // round_robin | weighted_round_robin | random | least_conn
+  // | p2c_ewma | consistent_hash | maglev
+  "policy": "p2c_ewma",
+
+  // Only consulted by the hashing policies.
+  "hash_key": { "source": "client_ip" },
+
+  "endpoints": [
+    { "name": "backend1", "address": "backend1:5000", "weight": 1 },
+    { "name": "backend2", "address": "backend2:5000", "weight": 1 },
+    { "name": "backend3", "address": "backend3:5000", "weight": 1 },
+    { "name": "backend4", "address": "backend4:5000", "weight": 1 }
+  ],
+
+  "health": {
+    "enabled": true,
+    "path": "/health",
+    "interval": 2.0,
+    "timeout": 1.0,
+    "rise": 2,
+    "fall": 3,
+    "expected_status": 200
+  },
+
+  // Passive failure detection.  Trips on sustained error rate OR a short
+  // burst of consecutive failures, then backs off exponentially.
+  "breaker": {
+    "error_threshold": 0.5,
+    "min_requests": 20,
+    "window": 10.0,
+    "cooldown": 5.0,
+    "max_cooldown": 60.0,
+    "consecutive_failures": 5,
+    "half_open_probes": 1
+  },
+
+  // Retries are capped as a fraction of live traffic so a partial outage
+  // cannot be amplified into a total one.
+  "retry": {
+    "enabled": true,
+    "max_attempts": 3,
+    "budget_ratio": 0.1,
+    "budget_min_per_sec": 3.0,
+    "buffer_bytes": 65536,
+    "retry_on_5xx": true,
+    "backoff_base": 0.005,
+    "backoff_max": 0.1
+  },
+
+  // Tail-latency insurance: send a second copy of an idempotent request once
+  // the first has already blown past the observed p99.
+  "hedge": {
+    "enabled": true,
+    "quantile": 0.99,
+    "min_delay": 0.01,
+    "max_delay": 1.0
+  },
+
+  "limits": {
+    "max_connections": 8192,
+    "rate_per_ip": 0,
+    "rate_burst": 0,
+    "max_body_bytes": 67108864,
+    "concurrency": {
+      "enabled": true,
+      "static_limit": 0,
+      "initial": 32,
+      "min_limit": 4,
+      "max_limit": 4096,
+      "smoothing": 0.2,
+      "max_queue": 1024,
+      "codel_target": 0.005,
+      "codel_interval": 0.1
+    }
+  },
+
+  "timeouts": {
+    "connect": 1.0,
+    "upstream_header": 10.0,
+    "upstream_body": 300.0,
+    "client_idle": 65.0,
+    "client_header": 10.0,
+    "drain": 15.0,
+    "tunnel_idle": 300.0
+  },
+
+  "pool": {
+    "enabled": true,
+    "max_idle_per_endpoint": 64,
+    "idle_timeout": 30.0
+  },
+
+  "log": {
+    // Buffered, but still ~10% of a worker's peak throughput; set "sample"
+    // below 1.0 to keep slow requests (>= slow_request seconds) and drop the rest.
+    "access": true,
+    "sample": 1.0,
+    "level": "info",
+    "slow_request": 1.0
+  },
+
+  // Below this fraction of healthy endpoints, stop trusting health checks and
+  // spray traffic across everything -- the checks are the likelier fault.
+  "panic_threshold": 0.5,
+  "ewma_tau": 10.0,
+  "debug_headers": true,
+  "trust_forwarded_for": false
+}

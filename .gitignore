@@ -1,0 +1,8 @@
+.env
+build/
+build-asan/
+
+# local scratch
+*.log
+lbtest.json
+.DS_Store

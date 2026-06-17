@@ -1,0 +1,137 @@
+# Full stack: 4 origins, the JDblance load balancer, nginx as a control group,
+# Prometheus and a pre-provisioned Grafana.  Every JDblance component comes from
+# the one image the Dockerfile builds.
+#
+#   docker compose up --build -d                        the stack
+#   docker compose --profile bench run --rm loadgen     a load test against it
+#   docker compose --profile alerts up -d alertbot      WhatsApp/console alerts
+#
+# Ports: 8000 JDblance data plane, 8001 JDblance control plane, 8080 nginx (compare),
+#        3001 Grafana, 9091 Prometheus, 5001-5004 the origins directly.
+
+x-backend: &backend
+  build: .
+  restart: unless-stopped
+  entrypoint: ["jdblance-origin"]
+  command: ["--port", "5000"]
+  # Deliberately not /health: that endpoint can be made to fail for chaos
+  # experiments, and Docker restarting the container would undo the test.
+  healthcheck:
+    test: ["CMD", "curl", "-sf", "http://127.0.0.1:5000/info"]
+    interval: 15s
+    timeout: 3s
+    retries: 3
+  networks: [mesh]
+
+services:
+  backend1:
+    <<: *backend
+    environment: [BACKEND_NAME=backend1]
+    ports: ["5001:5000"]
+  backend2:
+    <<: *backend
+    environment: [BACKEND_NAME=backend2]
+    ports: ["5002:5000"]
+  backend3:
+    <<: *backend
+    environment: [BACKEND_NAME=backend3]
+    ports: ["5003:5000"]
+  backend4:
+    <<: *backend
+    environment: [BACKEND_NAME=backend4]
+    ports: ["5004:5000"]
+
+  jdblance:
+    build: .
+    container_name: jdblance
+    restart: unless-stopped
+    # The config is mounted rather than baked so `docker compose kill -s HUP
+    # jdblance` reloads an edited policy without a rebuild.
+    volumes:
+      - ./lb.json:/etc/jdblance/lb.json:ro
+    environment:
+      # JDBLANCE_WORKERS=4 docker compose up -d   -> SO_REUSEPORT sharding
+      - JDBLANCE_WORKERS=${JDBLANCE_WORKERS:-1}
+    ports:
+      - "8000:8000"
+      # One control-plane port per worker: admin.port + worker index.
+      - "8001-8004:8001-8004"
+    depends_on: [backend1, backend2, backend3, backend4]
+    networks: [mesh]
+    # Draining takes up to timeouts.drain; give the container room to finish.
+    stop_grace_period: 20s
+
+  # Control group.  Same backends, same traffic, no adaptive anything --
+  # useful for showing what the extra machinery actually buys.
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: nginx-lb
+    restart: unless-stopped
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports: ["8080:80"]
+    depends_on: [backend1, backend2, backend3, backend4]
+    networks: [mesh]
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: prometheus
+    restart: unless-stopped
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules.yml:/etc/prometheus/rules.yml:ro
+      - prometheus-data:/prometheus
+    ports: ["9091:9090"]
+    networks: [mesh]
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: grafana
+    restart: unless-stopped
+    # Datasource and dashboard are provisioned from disk: no clicking through
+    # the import wizard to see the graphs.
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ALLOW_EMBEDDING=true
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_BASIC_ENABLED=false
+      - GF_USERS_DEFAULT_THEME=dark
+    ports: ["3001:3000"]
+    depends_on: [prometheus]
+    networks: [mesh]
+
+  # On-demand load generator.  Overriding the command is the normal way to use
+  # it:  docker compose --profile bench run --rm loadgen \
+  #        http://jdblance:8000/ --rate 5000 -d 30
+  loadgen:
+    build: .
+    profiles: [bench]
+    entrypoint: ["jdblance-loadgen"]
+    command: ["http://jdblance:8000/", "--rate", "2000", "-d", "20"]
+    healthcheck: {disable: true}
+    depends_on: [jdblance]
+    networks: [mesh]
+
+  alertbot:
+    build: .
+    profiles: [alerts]
+    entrypoint: ["jdblance-alertbot"]
+    command: ["--admin", "http://jdblance:8001"]
+    healthcheck: {disable: true}
+    env_file:
+      - path: .env
+        required: false
+    depends_on: [jdblance]
+    networks: [mesh]
+
+networks:
+  mesh:
+    driver: bridge
+
+volumes:
+  prometheus-data:
+  grafana-data:

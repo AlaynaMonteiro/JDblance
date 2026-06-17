@@ -1,0 +1,74 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # No dependency step on purpose: a compiler and make are the whole toolchain.
+      - name: Build
+        run: make -j"$(nproc)"
+      - name: Validate the shipped config
+        run: build/jdblance --check -c lb.json
+      - name: Unit, end-to-end and process tests
+        run: make test
+      - name: Same tests under AddressSanitizer + UBSan
+        run: make asan
+
+  chaos:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fault-injection demo
+        run: make -j"$(nproc)" demo
+
+  soak:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: make -j"$(nproc)" build/jdblance build/jdblance-origin build/jdblance-loadgen
+      - name: Start origins and balancer
+        run: |
+          build/jdblance-origin --host 127.0.0.1 --port 9001 --name b1 --latency-ms 2 &
+          build/jdblance-origin --host 127.0.0.1 --port 9002 --name b2 --latency-ms 2 &
+          build/jdblance-origin --host 127.0.0.1 --port 9003 --name b3 --latency-ms 20 &
+          sleep 1
+          build/jdblance -c lb.json --listen 127.0.0.1:8000 \
+            --endpoint b1=127.0.0.1:9001 \
+            --endpoint b2=127.0.0.1:9002 \
+            --endpoint b3=127.0.0.1:9003 > jdblance.log &
+          for i in $(seq 50); do curl -sf http://127.0.0.1:8001/readyz && break; sleep 0.1; done
+      # The generator fails the step if more than 0.1% of requests error or 5xx.
+      - name: Load test
+        run: build/jdblance-loadgen http://127.0.0.1:8000/ --rate 3000 -d 15 --max-error-rate 0.001
+      - name: The balancer's own view
+        run: |
+          curl -s http://127.0.0.1:8001/stats; echo
+          ! curl -s http://127.0.0.1:8001/metrics | grep -E '^jdblance_requests_total\{.*status="5'
+
+  docker:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the stack
+        run: docker compose build
+      - name: Boot and smoke test
+        run: |
+          docker compose up -d
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8001/readyz && break
+            sleep 2
+          done
+          curl -sf -o /dev/null -w 'proxy: %{http_code}\n' http://localhost:8000/
+          curl -sf http://localhost:5001/chaos -X POST -H 'content-type: application/json' -d '{"fail_rate":1}'
+          for i in $(seq 1 20); do curl -sf -o /dev/null http://localhost:8000/; done
+          curl -s http://localhost:8001/stats | head -c 600; echo
+      - name: Teardown
+        if: always()
+        run: docker compose down -v
