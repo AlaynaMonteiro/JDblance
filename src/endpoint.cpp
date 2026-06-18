@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 
+#include "hashring.hpp"
 #include "metrics.hpp"
 
 namespace jdblance {
@@ -266,6 +267,21 @@ bool Endpoint::selectable(double now) const {
   return admin_enabled && !draining && healthy && breaker.may_allow(now);
 }
 
+double Endpoint::slow_start_factor(double now, double window, double min_weight) const noexcept {
+  if (window <= 0 || now - warm_since >= window) return 1.0;
+  return std::max(min_weight, (now - warm_since) / window);
+}
+
+std::string Endpoint::sticky_token() const {
+  if (sticky_token_.empty()) {
+    static const char* hex = "0123456789abcdef";
+    uint64_t h = hash64(name, 0x5717);
+    sticky_token_.assign(16, '0');
+    for (int i = 15; i >= 0; --i, h >>= 4) sticky_token_[static_cast<size_t>(i)] = hex[h & 0xF];
+  }
+  return sticky_token_;
+}
+
 double Endpoint::ewma(double now) const {
   if (ewma_ == 0.0) return 0.0;
   return ewma_ * std::exp(-(now - ewma_stamp_) / ewma_tau);
@@ -357,6 +373,7 @@ Json Endpoint::snapshot() {
   double now = monotonic();
   Json out = Json::object();
   out["name"] = name;
+  out["upstream"] = upstream;
   out["address"] = address();
   out["weight"] = weight;
   out["healthy"] = healthy;

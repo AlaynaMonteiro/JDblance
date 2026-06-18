@@ -199,12 +199,107 @@ struct LogConfig {
   void visit(V& v) { v("access", access); v("sample", sample); v("level", level); v("slow_request", slow_request); }
 };
 
+// Cookie-based stickiness: the balancer names the backend it chose in a
+// cookie and honours it on later requests.  An empty cookie name disables it.
+struct StickyConfig {
+  std::string cookie;
+  double max_age = 0;   // seconds; 0 = session cookie
+  template <class V>
+  void visit(V& v) { v("cookie", cookie); v("max_age", max_age); }
+};
+
+// A named pool of endpoints with its own selection policy.  The top-level
+// policy / hash_key / sticky / endpoints form the pool called "default".
+struct UpstreamConfig {
+  std::string name;
+  std::string policy = "p2c_ewma";
+  HashKeyConfig hash_key;
+  StickyConfig sticky;
+  std::vector<EndpointConfig> endpoints;
+  template <class V>
+  void visit(V& v) {
+    v("name", name); v("policy", policy); v("hash_key", hash_key); v("sticky", sticky);
+    v("endpoints", endpoints);
+  }
+};
+
+// key: "client_ip", or "header:<Name>" (requests without the header fall back
+// to the client IP).  rate 0 disables.
+struct RouteRateLimit {
+  double rate = 0;
+  double burst = 0;
+  std::string key = "client_ip";
+  template <class V>
+  void visit(V& v) { v("rate", rate); v("burst", burst); v("key", key); }
+};
+
+// First match wins.  host: "" (any), "example.com" or "*.example.com".
+// prefix matches whole path segments: "/api" matches /api and /api/x, not /apix.
+struct RouteConfig {
+  std::string name;
+  std::string host;
+  std::string prefix = "/";
+  std::string upstream = "default";
+  bool strip_prefix = false;
+  bool cache = true;   // only matters when cache.enabled
+  RouteRateLimit rate_limit;
+  template <class V>
+  void visit(V& v) {
+    v("name", name); v("host", host); v("prefix", prefix); v("upstream", upstream);
+    v("strip_prefix", strip_prefix); v("cache", cache); v("rate_limit", rate_limit);
+  }
+};
+
+// Shared in-memory cache for GET responses that say they may be stored
+// (Cache-Control max-age / s-maxage, no Vary, no Set-Cookie).  Per worker.
+struct CacheConfig {
+  bool enabled = false;
+  double max_bytes = 64.0 * 1024 * 1024;
+  double max_object_bytes = 1024.0 * 1024;
+  template <class V>
+  void visit(V& v) { v("enabled", enabled); v("max_bytes", max_bytes); v("max_object_bytes", max_object_bytes); }
+};
+
+// A backend that just joined or recovered gets a share of its normal traffic
+// that ramps linearly from min_weight to 1 over `window` seconds.  0 disables.
+struct SlowStartConfig {
+  double window = 0;
+  double min_weight = 0.1;
+  template <class V>
+  void visit(V& v) { v("window", window); v("min_weight", min_weight); }
+};
+
+// Success-rate outlier detection: every `interval`, each endpoint with at least
+// `min_requests` in it is compared with its peers.  It is ejected, for
+// base_ejection * (times ejected in a row), when its success rate is below
+// the peers' mean by more than stdev_factor * their stdev *and* by more than
+// min_gap.
+struct OutlierConfig {
+  bool enabled = false;
+  double interval = 10.0;
+  int min_requests = 20;
+  int min_hosts = 3;
+  double stdev_factor = 1.9;
+  double min_gap = 0.1;
+  double base_ejection = 30.0;
+  double max_ejection_percent = 0.5;   // of the upstream; at least one is always allowed
+  template <class V>
+  void visit(V& v) {
+    v("enabled", enabled); v("interval", interval); v("min_requests", min_requests);
+    v("min_hosts", min_hosts); v("stdev_factor", stdev_factor); v("min_gap", min_gap);
+    v("base_ejection", base_ejection); v("max_ejection_percent", max_ejection_percent);
+  }
+};
+
 struct Config {
   ListenConfig listen;
   AdminConfig admin;
   std::string policy = "p2c_ewma";
   HashKeyConfig hash_key;
+  StickyConfig sticky;
   std::vector<EndpointConfig> endpoints;
+  std::vector<UpstreamConfig> upstreams;
+  std::vector<RouteConfig> routes;
   HealthConfig health;
   BreakerConfig breaker;
   RetryConfig retry;
@@ -213,6 +308,9 @@ struct Config {
   TimeoutConfig timeouts;
   PoolConfig pool;
   LogConfig log;
+  CacheConfig cache;
+  SlowStartConfig slow_start;
+  OutlierConfig outlier;
 
   double panic_threshold = 0.5;
   double ewma_tau = 10.0;
@@ -228,8 +326,10 @@ struct Config {
   template <class V>
   void visit(V& v) {
     v("listen", listen); v("admin", admin); v("policy", policy); v("hash_key", hash_key);
-    v("endpoints", endpoints); v("health", health); v("breaker", breaker); v("retry", retry);
+    v("sticky", sticky); v("endpoints", endpoints); v("upstreams", upstreams); v("routes", routes);
+    v("health", health); v("breaker", breaker); v("retry", retry);
     v("hedge", hedge); v("limits", limits); v("timeouts", timeouts); v("pool", pool); v("log", log);
+    v("cache", cache); v("slow_start", slow_start); v("outlier", outlier);
     v("panic_threshold", panic_threshold); v("ewma_tau", ewma_tau); v("vnodes", vnodes);
     v("bounded_load_factor", bounded_load_factor); v("maglev_table_size", maglev_table_size);
     v("debug_headers", debug_headers); v("trust_forwarded_for", trust_forwarded_for);
@@ -242,7 +342,11 @@ struct Config {
   static Config from_json(const Json& data, bool validate = true);
   void validate() const;
   Json to_json() const;
+  // The "default" upstream (when top-level endpoints exist) followed by `upstreams`.
+  std::vector<UpstreamConfig> all_upstreams() const;
 };
+
+inline constexpr const char* kDefaultUpstream = "default";
 
 // Exposed for tests.
 std::string strip_comments(std::string_view raw);

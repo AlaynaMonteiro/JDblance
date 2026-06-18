@@ -161,14 +161,15 @@ class Reader {
     if (!v.is_string()) mismatch(where, "a string or null", v);
     out = v.as_string();
   }
-  static void read(const Json& v, std::vector<EndpointConfig>& out, const std::string& where) {
+  template <typename T>
+  static void read(const Json& v, std::vector<T>& out, const std::string& where) {
     if (!v.is_array()) mismatch(where, "an array", v);
     out.clear();
     const auto& arr = v.as_array();
     for (size_t i = 0; i < arr.size(); ++i) {
-      EndpointConfig e;
-      read(arr[i], e, where + "[" + std::to_string(i) + "]");
-      out.push_back(std::move(e));
+      T item;
+      read(arr[i], item, where + "[" + std::to_string(i) + "]");
+      out.push_back(std::move(item));
     }
   }
   template <typename T, std::enable_if_t<has_visit<T>::value, int> = 0>
@@ -198,7 +199,8 @@ class Writer {
   static Json write(double v) { return Json(v); }
   static Json write(const std::string& v) { return Json(v); }
   static Json write(const std::optional<std::string>& v) { return v ? Json(*v) : Json(); }
-  static Json write(const std::vector<EndpointConfig>& v) {
+  template <typename T>
+  static Json write(const std::vector<T>& v) {
     Json arr = Json::array();
     for (const auto& e : v) arr.push_back(write(e));
     return arr;
@@ -304,21 +306,39 @@ Json Config::to_json() const {
   return std::move(w.out);
 }
 
-void Config::validate() const {
-  require(std::find(kPolicyNames.begin(), kPolicyNames.end(), policy) != kPolicyNames.end(),
-          "unknown policy \"" + policy +
+std::vector<UpstreamConfig> Config::all_upstreams() const {
+  std::vector<UpstreamConfig> out;
+  if (!endpoints.empty()) {
+    UpstreamConfig primary;
+    primary.name = kDefaultUpstream;
+    primary.policy = policy;
+    primary.hash_key = hash_key;
+    primary.sticky = sticky;
+    primary.endpoints = endpoints;
+    out.push_back(std::move(primary));
+  }
+  out.insert(out.end(), upstreams.begin(), upstreams.end());
+  return out;
+}
+
+namespace {
+void validate_upstream(const UpstreamConfig& up, std::set<std::string>& endpoint_names,
+                       int maglev_table_size) {
+  std::string where = up.name == kDefaultUpstream ? "" : "upstream " + up.name + ": ";
+  require(std::find(kPolicyNames.begin(), kPolicyNames.end(), up.policy) != kPolicyNames.end(),
+          where + "unknown policy \"" + up.policy +
               "\"; valid: consistent_hash, least_conn, maglev, p2c_ewma, random, round_robin, "
               "weighted_round_robin");
-
-  require(!endpoints.empty(), "at least one endpoint is required");
-  std::set<std::string> names;
-  for (size_t i = 0; i < endpoints.size(); ++i) {
-    const EndpointConfig& e = endpoints[i];
-    std::string label = e.name.empty() ? "endpoints[" + std::to_string(i) + "]" : "endpoint " + e.name;
+  require(!up.endpoints.empty(), where + "at least one endpoint is required");
+  for (size_t i = 0; i < up.endpoints.size(); ++i) {
+    const EndpointConfig& e = up.endpoints[i];
+    std::string label = where + (e.name.empty() ? "endpoints[" + std::to_string(i) + "]" : "endpoint " + e.name);
     require(!e.name.empty(), label + ": name is required");
     require(valid_endpoint_name(e.name),
             label + ": name may only contain letters, digits and - _ . ~ : @");
-    require(names.insert(e.name).second, "endpoint names must be unique (\"" + e.name + "\" repeats)");
+    // Unique across every upstream: names are admin URLs and metric labels.
+    require(endpoint_names.insert(e.name).second,
+            "endpoint names must be unique (\"" + e.name + "\" repeats)");
     size_t colon = e.address.rfind(':');
     require(colon != std::string::npos && colon > 0, label + ": address must be host:port");
     int port = 0;
@@ -335,14 +355,77 @@ void Config::validate() const {
     require(e.weight >= 1 && e.weight <= 1000000, label + ": weight must be between 1 and 1000000");
   }
 
+  const HashKeyConfig& hk = up.hash_key;
   static const std::array<std::string_view, 5> sources = {"client_ip", "header", "cookie", "path",
                                                           "query"};
-  require(std::find(sources.begin(), sources.end(), hash_key.source) != sources.end(),
-          "unknown hash_key.source \"" + hash_key.source + "\"");
-  require(!((hash_key.source == "header" || hash_key.source == "cookie" ||
-             hash_key.source == "query") &&
-            hash_key.name.empty()),
-          "hash_key.source=" + hash_key.source + " requires hash_key.name");
+  require(std::find(sources.begin(), sources.end(), hk.source) != sources.end(),
+          where + "unknown hash_key.source \"" + hk.source + "\"");
+  require(!((hk.source == "header" || hk.source == "cookie" || hk.source == "query") && hk.name.empty()),
+          where + "hash_key.source=" + hk.source + " requires hash_key.name");
+  require(up.sticky.cookie.empty() || http::is_token(up.sticky.cookie),
+          where + "sticky.cookie must be a valid cookie name");
+  require(up.sticky.max_age >= 0, where + "sticky.max_age must be >= 0");
+  // Maglev's permutation only visits every slot when the size is prime.
+  require(is_prime(maglev_table_size) && maglev_table_size <= 10000019 &&
+              static_cast<size_t>(maglev_table_size) > up.endpoints.size(),
+          "maglev_table_size must be a prime larger than the endpoint count (e.g. 65537)");
+}
+
+bool valid_route_host(const std::string& host) {
+  if (host.empty()) return true;
+  std::string_view rest = host;
+  if (rest.substr(0, 2) == "*.") rest.remove_prefix(2);
+  return !rest.empty() && std::all_of(rest.begin(), rest.end(), [](char ch) {
+    return std::islower(static_cast<unsigned char>(ch)) || std::isdigit(static_cast<unsigned char>(ch)) ||
+           ch == '.' || ch == '-';
+  });
+}
+}  // namespace
+
+void Config::validate() const {
+  std::vector<UpstreamConfig> pools = all_upstreams();
+  require(!pools.empty(), "at least one endpoint is required");
+  std::set<std::string> endpoint_names;
+  std::set<std::string> pool_names;
+  for (const UpstreamConfig& up : upstreams) {
+    require(valid_endpoint_name(up.name), "upstream names may only contain letters, digits and - _ . ~ : @");
+    require(up.name != kDefaultUpstream,
+            "\"default\" is the top-level endpoint list; give this upstream another name");
+  }
+  for (const UpstreamConfig& up : pools) {
+    require(pool_names.insert(up.name).second, "upstream names must be unique (\"" + up.name + "\" repeats)");
+    validate_upstream(up, endpoint_names, maglev_table_size);
+  }
+
+  std::set<std::string> route_names;
+  for (size_t i = 0; i < routes.size(); ++i) {
+    const RouteConfig& r = routes[i];
+    std::string label = "routes[" + std::to_string(i) + "]";
+    require(valid_endpoint_name(r.name), label + ": name is required (letters, digits and - _ . ~ : @)");
+    label = "route " + r.name;
+    require(route_names.insert(r.name).second, "route names must be unique (\"" + r.name + "\" repeats)");
+    require(pool_names.count(r.upstream), label + ": unknown upstream \"" + r.upstream + "\"");
+    require(!r.prefix.empty() && r.prefix[0] == '/' &&
+                std::all_of(r.prefix.begin(), r.prefix.end(), [](char ch) { return ch > 0x20 && ch < 0x7F && ch != '?'; }),
+            label + ": prefix must start with / and contain no spaces or ?");
+    require(valid_route_host(r.host), label + ": host must be lower-case, like example.com or *.example.com");
+    require(r.rate_limit.rate >= 0 && r.rate_limit.burst >= 0, label + ": rate_limit must be >= 0");
+    const std::string& key = r.rate_limit.key;
+    require(key == "client_ip" || (key.rfind("header:", 0) == 0 && http::is_token(key.substr(7))),
+            label + ": rate_limit.key must be client_ip or header:<Name>");
+  }
+
+  require(cache.max_bytes >= 0 && cache.max_object_bytes >= 0 && cache.max_object_bytes <= cache.max_bytes,
+          "cache needs 0 <= max_object_bytes <= max_bytes");
+  require(slow_start.window >= 0, "slow_start.window must be >= 0");
+  require(slow_start.min_weight > 0 && slow_start.min_weight <= 1, "slow_start.min_weight must be in (0, 1]");
+  require(outlier.interval > 0 && outlier.base_ejection > 0, "outlier.interval and base_ejection must be > 0");
+  require(outlier.min_requests >= 1 && outlier.min_hosts >= 2,
+          "outlier needs min_requests >= 1 and min_hosts >= 2");
+  require(outlier.stdev_factor > 0, "outlier.stdev_factor must be > 0");
+  require(outlier.min_gap >= 0 && outlier.min_gap <= 1, "outlier.min_gap must be between 0 and 1");
+  require(outlier.max_ejection_percent >= 0 && outlier.max_ejection_percent <= 1,
+          "outlier.max_ejection_percent must be between 0 and 1");
 
   require(panic_threshold >= 0.0 && panic_threshold <= 1.0, "panic_threshold must be between 0 and 1");
   require(listen.workers >= 1 && listen.workers <= 256, "listen.workers must be between 1 and 256");
@@ -404,10 +487,6 @@ void Config::validate() const {
   require(ewma_tau > 0, "ewma_tau must be > 0");
   require(vnodes >= 1 && vnodes <= 10000, "vnodes must be 1..10000");
   require(bounded_load_factor >= 0, "bounded_load_factor must be >= 0 (0 disables the bound)");
-  // Maglev's permutation only visits every slot when the size is prime.
-  require(is_prime(maglev_table_size) && maglev_table_size <= 10000019 &&
-              static_cast<size_t>(maglev_table_size) > endpoints.size(),
-          "maglev_table_size must be a prime larger than the endpoint count (e.g. 65537)");
   // Goes out verbatim in every Via header.
   require(!server_name.empty() && server_name.size() <= 64 &&
               std::all_of(server_name.begin(), server_name.end(),

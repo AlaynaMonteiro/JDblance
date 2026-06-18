@@ -25,42 +25,93 @@ void Proxy::CancelToken::cancel() {
 // ---------------------------------------------------------------------------
 
 namespace {
-std::optional<double> burst_of(const Config& cfg) {
-  if (cfg.limits.rate_burst > 0) return cfg.limits.rate_burst;
+std::optional<double> burst_of(double burst) {
+  if (burst > 0) return burst;
   return std::nullopt;
 }
 
-std::string balancer_signature(const Config& cfg) {
-  return cfg.policy + "|" + std::to_string(cfg.vnodes) + "|" + format_number(cfg.bounded_load_factor) +
-         "|" + std::to_string(cfg.maglev_table_size);
+std::unique_ptr<KeyedRateLimiter> route_limiter(const RouteRateLimit& spec) {
+  if (spec.rate <= 0) return nullptr;
+  return std::make_unique<KeyedRateLimiter>(spec.rate, burst_of(spec.burst));
+}
+
+bool same_limit(const RouteRateLimit& a, const RouteRateLimit& b) {
+  return a.rate == b.rate && a.burst == b.burst && a.key == b.key;
 }
 }  // namespace
 
 Cluster::Cluster(const Config& cfg)
     : retry_budget(cfg.retry.budget_ratio, cfg.retry.budget_min_per_sec),
-      rate_limiter(std::make_unique<KeyedRateLimiter>(cfg.limits.rate_per_ip, burst_of(cfg))),
+      rate_limiter(std::make_unique<KeyedRateLimiter>(cfg.limits.rate_per_ip, burst_of(cfg.limits.rate_burst))),
       admission(AdmissionController::from_config(cfg.limits.concurrency)),
-      health(cfg.health),
-      panic_threshold_(cfg.panic_threshold) {
+      health(cfg.health) {
   apply_config(cfg);
 }
 
 void Cluster::apply_config(const Config& cfg) {
-  panic_threshold_ = cfg.panic_threshold;
   retry_budget.configure(cfg.retry.budget_ratio, cfg.retry.budget_min_per_sec);
   // Rebuilding forgets every client's bucket, so only do it on a real change.
-  if (rate_limiter->rate() != cfg.limits.rate_per_ip || burst_of(cfg) != rate_burst_) {
-    rate_limiter = std::make_unique<KeyedRateLimiter>(cfg.limits.rate_per_ip, burst_of(cfg));
+  if (rate_limiter->rate() != cfg.limits.rate_per_ip || burst_of(cfg.limits.rate_burst) != rate_burst_) {
+    rate_limiter = std::make_unique<KeyedRateLimiter>(cfg.limits.rate_per_ip, burst_of(cfg.limits.rate_burst));
   }
-  rate_burst_ = burst_of(cfg);
+  rate_burst_ = burst_of(cfg.limits.rate_burst);
   admission->configure(cfg.limits.concurrency);
-
-  std::string signature = balancer_signature(cfg);
-  if (signature != balancer_signature_) {
-    balancer_ = build_balancer(cfg.policy, cfg.vnodes, cfg.bounded_load_factor, cfg.maglev_table_size);
-    balancer_signature_ = signature;
+  if (cfg.cache.enabled) {
+    cache.configure(static_cast<size_t>(cfg.cache.max_bytes), static_cast<size_t>(cfg.cache.max_object_bytes));
+  } else {
+    cache.configure(0, 0);
   }
-  apply_endpoints(cfg);
+
+  // Upstreams: survivors (by name) keep their balancer and outlier state.
+  std::vector<EndpointPtr> previous = endpoints_;
+  std::vector<std::shared_ptr<Upstream>> rebuilt;
+  for (const UpstreamConfig& spec : cfg.all_upstreams()) {
+    std::shared_ptr<Upstream> up = upstream(spec.name);
+    if (!up) up = std::make_shared<Upstream>(spec.name);
+    up->apply(spec, cfg, previous);
+    rebuilt.push_back(std::move(up));
+  }
+  upstreams_ = std::move(rebuilt);
+
+  endpoints_.clear();
+  for (const auto& up : upstreams_) {
+    endpoints_.insert(endpoints_.end(), up->endpoints().begin(), up->endpoints().end());
+  }
+  for (const EndpointPtr& old : previous) {
+    if (std::find(endpoints_.begin(), endpoints_.end(), old) != endpoints_.end()) continue;
+    old->pool.clear();
+    bool name_survives = std::any_of(endpoints_.begin(), endpoints_.end(),
+                                     [&](const EndpointPtr& e) { return e->name == old->name; });
+    if (!name_survives) metrics::forget_endpoint(old->name);
+  }
+  for (const EndpointPtr& e : endpoints_) {
+    metrics::ENDPOINT_UP.set({e->name}, e->healthy ? 1 : 0);
+    metrics::ENDPOINT_BREAKER.set({e->name}, static_cast<double>(e->breaker.state()));
+    metrics::ENDPOINT_INFLIGHT.set({e->name}, e->inflight);
+  }
+
+  // Routes: a survivor with the same limit keeps its buckets.
+  std::vector<RoutePtr> routes;
+  for (const RouteConfig& spec : cfg.routes) {
+    auto route = std::make_shared<Route>();
+    route->spec = spec;
+    route->upstream = upstream(spec.upstream);
+    auto old = std::find_if(routes_.begin(), routes_.end(),
+                            [&](const RoutePtr& r) { return r->spec.name == spec.name; });
+    if (old != routes_.end() && same_limit((*old)->spec.rate_limit, spec.rate_limit)) {
+      route->limiter = std::move((*old)->limiter);
+    } else {
+      route->limiter = route_limiter(spec.rate_limit);
+    }
+    routes.push_back(std::move(route));
+  }
+  routes_ = std::move(routes);
+  default_route_.reset();
+  if (std::shared_ptr<Upstream> fallback = upstream(kDefaultUpstream)) {
+    default_route_ = std::make_shared<Route>();
+    default_route_->spec.name = kDefaultUpstream;
+    default_route_->upstream = std::move(fallback);
+  }
 
   health_enabled_ = cfg.health.enabled;
   health.update(cfg.health, endpoints_);
@@ -75,87 +126,35 @@ void Cluster::start_health() {
   if (health_enabled_ && !health.running()) health.start();
 }
 
-void Cluster::apply_endpoints(const Config& cfg) {
-  int max_idle = cfg.pool.enabled ? cfg.pool.max_idle_per_endpoint : 0;
-  std::vector<EndpointPtr> rebuilt;
-  rebuilt.reserve(cfg.endpoints.size());
-  for (const EndpointConfig& spec : cfg.endpoints) {
-    EndpointPtr previous = find(spec.name);
-    if (previous && previous->address() == spec.address) {
-      previous->weight = std::max(1, spec.weight);
-      previous->admin_enabled = spec.enabled;
-      previous->ewma_tau = cfg.ewma_tau;
-      previous->breaker.configure(cfg.breaker);
-      previous->pool.configure(max_idle, cfg.pool.idle_timeout);
-      rebuilt.push_back(previous);
-      continue;
+RoutePtr Cluster::route(const http::Request& req) const {
+  if (!routes_.empty()) {
+    std::string host = request_host(req);
+    std::string_view path = req.path();
+    for (const RoutePtr& r : routes_) {
+      if (route_host_matches(r->spec.host, host) && route_prefix_matches(r->spec.prefix, path)) return r;
     }
-    auto endpoint = std::make_shared<Endpoint>(spec.name, spec.host(), spec.port(), spec.weight,
-                                               CircuitBreaker(cfg.breaker),
-                                               ConnectionPool(max_idle, cfg.pool.idle_timeout),
-                                               cfg.ewma_tau);
-    endpoint->admin_enabled = spec.enabled;
-    rebuilt.push_back(std::move(endpoint));
   }
-
-  for (const EndpointPtr& old : endpoints_) {
-    if (std::find(rebuilt.begin(), rebuilt.end(), old) != rebuilt.end()) continue;
-    old->pool.clear();
-    bool name_survives = std::any_of(rebuilt.begin(), rebuilt.end(),
-                                     [&](const EndpointPtr& e) { return e->name == old->name; });
-    if (!name_survives) metrics::forget_endpoint(old->name);
-  }
-
-  endpoints_ = std::move(rebuilt);
-  for (const EndpointPtr& e : endpoints_) {
-    metrics::ENDPOINT_UP.set({e->name}, e->healthy ? 1 : 0);
-    metrics::ENDPOINT_BREAKER.set({e->name}, static_cast<double>(e->breaker.state()));
-    metrics::ENDPOINT_INFLIGHT.set({e->name}, e->inflight);
-  }
-  balancer_->notify_membership(endpoints_);
+  return default_route_;
 }
 
-std::pair<std::vector<EndpointPtr>, bool> Cluster::candidates(double now) const {
-  std::vector<EndpointPtr> live;
-  std::vector<EndpointPtr> configured;
-  for (const EndpointPtr& e : endpoints_) {
-    if (!e->admin_enabled || e->draining) continue;
-    configured.push_back(e);
-    if (e->selectable(now)) live.push_back(e);
-  }
-  if (configured.empty()) return {{}, false};
-  if (static_cast<double>(live.size()) / static_cast<double>(configured.size()) < panic_threshold_) {
-    // Panic: trust nothing, spray everything that is administratively in.
-    return {std::move(configured), true};
-  }
-  return {std::move(live), false};
-}
-
-EndpointPtr Cluster::select(const std::optional<std::string>& key,
-                            const std::vector<std::string>& exclude) {
-  double now = monotonic();
-  auto [pool, panic] = candidates(now);
-  if (!exclude.empty()) {
-    std::vector<EndpointPtr> filtered;
-    for (const EndpointPtr& e : pool) {
-      if (std::find(exclude.begin(), exclude.end(), e->name) == exclude.end()) filtered.push_back(e);
-    }
-    if (!filtered.empty()) pool = std::move(filtered);
-  }
-  while (!pool.empty()) {
-    EndpointPtr chosen = balancer_->pick(pool, key);
-    // allow() only for the endpoint actually chosen: asking every candidate
-    // would consume half-open probe slots that no request then uses.
-    if (panic || chosen->breaker.allow(now)) return chosen;
-    pool.erase(std::find(pool.begin(), pool.end(), chosen));
+std::shared_ptr<Upstream> Cluster::upstream(std::string_view name) const {
+  for (const auto& up : upstreams_) {
+    if (up->name() == name) return up;
   }
   return nullptr;
 }
 
 size_t Cluster::usable() const {
+  size_t total = 0;
+  for (const auto& up : upstreams_) total += up->usable();
+  return total;
+}
+
+bool Cluster::ready() const {
   double now = monotonic();
-  return static_cast<size_t>(std::count_if(endpoints_.begin(), endpoints_.end(),
-                                           [&](const EndpointPtr& e) { return e->selectable(now); }));
+  return std::all_of(upstreams_.begin(), upstreams_.end(), [&](const auto& up) {
+    return up->usable(now) > 0 && !up->in_panic(now);
+  });
 }
 
 EndpointPtr Cluster::find(std::string_view name) const {
@@ -166,9 +165,15 @@ EndpointPtr Cluster::find(std::string_view name) const {
 }
 
 Json Cluster::snapshot() {
-  auto [_, panic] = candidates();
+  double now = monotonic();
+  bool panic = false;
+  Json upstreams = Json::array();
+  for (const auto& up : upstreams_) {
+    upstreams.push_back(up->snapshot(now));
+    panic = panic || up->in_panic(now);
+  }
   Json out = Json::object();
-  out["policy"] = balancer_->name();
+  out["policy"] = primary().balancer().name();
   out["panic_mode"] = panic;
   out["healthy"] = usable();
   out["total"] = endpoints_.size();
@@ -177,6 +182,24 @@ Json Cluster::snapshot() {
   Json endpoints = Json::array();
   for (const EndpointPtr& e : endpoints_) endpoints.push_back(e->snapshot());
   out["endpoints"] = std::move(endpoints);
+  out["upstreams"] = std::move(upstreams);
+  Json routes = Json::array();
+  for (const RoutePtr& r : routes_) {
+    Json route = Json::object();
+    route["name"] = r->spec.name;
+    route["host"] = r->spec.host;
+    route["prefix"] = r->spec.prefix;
+    route["upstream"] = r->spec.upstream;
+    route["rate_limit"] = r->limiter ? Json(r->spec.rate_limit.rate) : Json();
+    routes.push_back(std::move(route));
+  }
+  out["routes"] = std::move(routes);
+  Json cache_stats = Json::object();
+  cache_stats["entries"] = cache.size();
+  cache_stats["bytes"] = cache.bytes();
+  cache_stats["hits"] = metrics::CACHE.value({"hit"});
+  cache_stats["misses"] = metrics::CACHE.value({"miss"});
+  out["cache"] = std::move(cache_stats);
   return out;
 }
 
@@ -379,11 +402,56 @@ Task<bool> Proxy::serve(ClientConn& conn, http::Request& req) {
     early_reason = "rate limit exceeded";
     early_extra = {{"Retry-After", "1"}};
   }
+  RoutePtr route;
+  if (early_status == 0) {
+    route = cluster_.route(req);
+    if (!route) {
+      early_status = 404;
+      early_reason = "no route for this request";
+    }
+  }
+  if (early_status == 0) {
+    ctx.route = route->spec.name;
+    metrics::ROUTE_REQUESTS.inc({ctx.route});
+    if (route->limiter) {
+      std::string bucket = ctx.source_ip;
+      const std::string& kind = route->spec.rate_limit.key;
+      if (kind.rfind("header:", 0) == 0) {
+        const std::string* value = req.get(std::string_view(kind).substr(7));
+        // Prefixed so a header value can never share a bucket with an IP.
+        if (value != nullptr && !value->empty()) bucket = "h:" + *value;
+      }
+      if (!route->limiter->allow(bucket)) {
+        metrics::SHED.inc({"route_rate_limit"});
+        early_status = 429;
+        early_reason = "rate limit exceeded";
+        early_extra = {{"Retry-After", "1"}};
+      }
+    }
+  }
   if (early_status != 0) {
     ctx.status = early_status;
     co_await send_error(conn, early_status, early_reason, ctx.request_id, head_only, early_extra);
     finish(req, ctx);
     co_return false;
+  }
+
+  // A cache hit costs no admission slot and no backend.
+  std::string cache_key;
+  if (cfg_.cache.enabled && route->spec.cache && request_may_use_cache(req, framing)) {
+    cache_key = route->spec.name + "\n" + request_host(req) + "\n" + req.target;
+    if (std::shared_ptr<const CachedResponse> hit = cluster_.cache.get(cache_key, ctx.started)) {
+      metrics::CACHE.inc({"hit"});
+      ctx.cache = "hit";
+      ctx.endpoint = "cache";
+      ctx.status = hit->status;
+      bool keep = co_await serve_cached(conn, req, *hit, keepalive);
+      finish(req, ctx);
+      co_return keep;
+    }
+    metrics::CACHE.inc({"miss"});
+    ctx.cache = "miss";
+    if (head_only) cache_key.clear();   // a HEAD response has no body to store
   }
 
   bool admitted = co_await cluster_.admission->acquire();
@@ -402,7 +470,7 @@ Task<bool> Proxy::serve(ClientConn& conn, http::Request& req) {
 
   bool keep = false;
   try {
-    keep = co_await forward(conn, req, framing, ctx, keepalive);
+    keep = co_await forward(conn, req, framing, ctx, keepalive, route, std::move(cache_key));
   } catch (const std::exception& e) {
     log::error(std::string("unexpected error in forward: ") + e.what());
     if (ctx.status == 0) ctx.status = 500;
@@ -424,7 +492,7 @@ Task<bool> Proxy::serve(ClientConn& conn, http::Request& req) {
 }
 
 Task<bool> Proxy::forward(ClientConn& conn, http::Request& req, http::Framing framing,
-                          RequestCtx& ctx, bool client_keepalive) {
+                          RequestCtx& ctx, bool client_keepalive, RoutePtr route, std::string cache_key) {
   bool head_only = req.method == "HEAD";
   int fail_status = 0;
   std::string fail_reason;
@@ -458,18 +526,37 @@ Task<bool> Proxy::forward(ClientConn& conn, http::Request& req, http::Framing fr
       }
     }
 
-    std::optional<std::string> key = affinity_key(req, ctx.source_ip);
-    auto head = std::make_shared<const std::string>(build_upstream_head(req, framing, body.get(), ctx));
-    Dispatched d = co_await dispatch(conn, req, framing, body, key, head);
+    std::shared_ptr<Upstream> upstream = route->upstream;
+    // Copies: a reload may change the upstream's spec while this request waits.
+    HashKeyConfig hash_key = upstream->spec().hash_key;
+    StickyConfig sticky = upstream->spec().sticky;
+    std::optional<std::string> key = affinity_key(req, ctx.source_ip, hash_key);
+    std::string target =
+        route->spec.strip_prefix ? strip_route_prefix(req.target, route->spec.prefix) : req.target;
+    auto head = std::make_shared<const std::string>(build_upstream_head(req, framing, body.get(), ctx, target));
+    std::string preferred;
+    if (!sticky.cookie.empty()) preferred = cookie_value(req, sticky.cookie).value_or("");
+    Dispatched d = co_await dispatch(conn, req, framing, body, key, head, upstream, preferred);
     Exchange& ex = d.exchange;
     ctx.endpoint = ex.endpoint->name;
     ctx.status = ex.response.status;
     ctx.attempts = d.attempts;
     ctx.hedged = d.hedged;
 
+    ResponseExtras extras;
+    extras.cache_key = std::move(cache_key);
+    if (!sticky.cookie.empty() && ex.endpoint->sticky_token() != preferred) {
+      // New client, or its backend went away: point it at the one that served it.
+      extras.set_cookie = sticky.cookie + "=" + ex.endpoint->sticky_token() + "; Path=/; HttpOnly; SameSite=Lax";
+      if (sticky.max_age > 0) {
+        extras.set_cookie += "; Max-Age=" + std::to_string(static_cast<long long>(sticky.max_age));
+      }
+    }
+
     // From the first byte written, the request is no longer retryable.
     response_started = true;
-    RelayOutcome out = co_await relay_response(conn, req, ex, client_keepalive, d.attempts, d.hedged);
+    RelayOutcome out =
+        co_await relay_response(conn, req, ex, client_keepalive, d.attempts, d.hedged, extras);
     ex.endpoint->add_inflight(-1);
     ex.endpoint->record(ex.response.status < 500, ex.response.status);
     ex.endpoint->observe_latency(ex.elapsed);
@@ -530,11 +617,12 @@ Task<Proxy::Dispatched> Proxy::dispatch(ClientConn& conn, const http::Request& r
                                         http::Framing framing,
                                         std::shared_ptr<const std::string> body,
                                         const std::optional<std::string>& key,
-                                        std::shared_ptr<const std::string> head) {
+                                        std::shared_ptr<const std::string> head,
+                                        std::shared_ptr<Upstream> upstream, std::string preferred) {
   bool retryable = body != nullptr && cfg_.retry.enabled;
   int max_attempts = retryable ? cfg_.retry.max_attempts : 1;
   bool hedge_ok = cfg_.hedge.enabled && req.idempotent() && framing.empty() &&
-                  cluster_.endpoints().size() > 1;
+                  upstream->endpoints().size() > 1;
 
   AttemptInput input;
   input.method = req.method;
@@ -557,7 +645,9 @@ Task<Proxy::Dispatched> Proxy::dispatch(ClientConn& conn, const http::Request& r
                             cfg_.retry.backoff_base * std::pow(2.0, attempt - 1));
       if (cap > 0) co_await sleep_for(uniform(0.0, cap));
     }
-    EndpointPtr endpoint = cluster_.select(key, tried);
+    // The sticky preference applies to the first attempt only: a retry is
+    // exactly the case where that backend just failed.
+    EndpointPtr endpoint = upstream->select(key, tried, attempt == 0 ? preferred : std::string());
     if (!endpoint) {
       if (last_error) break;
       throw UpstreamError("no healthy upstream", false, 503);
@@ -569,7 +659,7 @@ Task<Proxy::Dispatched> Proxy::dispatch(ClientConn& conn, const http::Request& r
     bool hedged = false;
     try {
       if (hedge_ok && attempt == 0) {
-        std::pair<Exchange, bool> raced = co_await hedged_attempt(endpoint, input, key, tried);
+        std::pair<Exchange, bool> raced = co_await hedged_attempt(endpoint, input, key, tried, *upstream);
         exchange.emplace(std::move(raced.first));
         hedged = raced.second;
       } else {
@@ -636,7 +726,7 @@ Task<void> Proxy::race_runner(Proxy* self, std::shared_ptr<HedgeRace> race, int 
 
 Task<std::pair<Exchange, bool>> Proxy::hedged_attempt(EndpointPtr primary, AttemptInput input,
                                                       const std::optional<std::string>& key,
-                                                      std::vector<std::string>& tried) {
+                                                      std::vector<std::string>& tried, Upstream& upstream) {
   std::optional<double> delay = hedge_delay();
   if (!delay) {
     Exchange ex = co_await attempt(primary, input, nullptr);
@@ -652,7 +742,7 @@ Task<std::pair<Exchange, bool>> Proxy::hedged_attempt(EndpointPtr primary, Attem
   bool settled = co_await race->wake.wait(monotonic() + *delay);
   if (!settled && cluster_.retry_budget.try_retry()) {
     // Chosen only now that the hedge actually fires.
-    EndpointPtr backup = cluster_.select(key, tried);
+    EndpointPtr backup = upstream.select(key, tried);
     if (backup && backup != primary) {
       metrics::HEDGES.inc();
       tried.push_back(backup->name);
@@ -832,7 +922,7 @@ std::optional<double> Proxy::hedge_delay() const {
 
 Task<Proxy::RelayOutcome> Proxy::relay_response(ClientConn& conn, const http::Request& req,
                                                 Exchange& ex, bool client_keepalive, int attempts,
-                                                bool hedged) {
+                                                bool hedged, const ResponseExtras& extras) {
   RelayOutcome out;
   const http::Response& resp = ex.response;
   if (resp.status == 101) {
@@ -861,6 +951,12 @@ Task<Proxy::RelayOutcome> Proxy::relay_response(ClientConn& conn, const http::Re
     client_keepalive = false;
   }
   headers.emplace_back("Connection", client_keepalive ? "keep-alive" : "close");
+  if (!extras.set_cookie.empty()) headers.emplace_back("Set-Cookie", extras.set_cookie);
+  std::optional<Freshness> fresh;
+  if (!extras.cache_key.empty()) {
+    fresh = response_freshness(resp, framing);
+    if (fresh && framing.length > cluster_.cache.max_object_bytes()) fresh.reset();
+  }
   if (cfg_.debug_headers) {
     char took[32];
     std::snprintf(took, sizeof took, "%.2fms", ex.elapsed * 1000.0);
@@ -868,6 +964,7 @@ Task<Proxy::RelayOutcome> Proxy::relay_response(ClientConn& conn, const http::Re
     headers.emplace_back("X-Upstream-Time", took);
     if (attempts > 1) headers.emplace_back("X-Attempts", std::to_string(attempts));
     if (hedged) headers.emplace_back("X-Hedged", "1");
+    if (!extras.cache_key.empty()) headers.emplace_back("X-Cache", "MISS");
   }
   headers.emplace_back("Via", "1.1 " + cfg_.server_name);
   std::string head = http::encode_response(resp.status, headers, resp.reason);
@@ -876,10 +973,25 @@ Task<Proxy::RelayOutcome> Proxy::relay_response(ClientConn& conn, const http::Re
   uint64_t moved = 0;
   bool complete = false;
   try {
-    if (framing.kind == http::BodyKind::Length && ex.reader->buffered() >= framing.length) {
-      // The whole body arrived with the head (the common small response):
-      // one write, one segment, no relay loop.
-      std::string body = co_await ex.reader->read_exact(static_cast<size_t>(framing.length), deadline);
+    bool whole = framing.kind == http::BodyKind::Length && ex.reader->buffered() >= framing.length;
+    if (whole || fresh) {
+      // The whole body arrived with the head (the common small response), or
+      // it is about to be cached and has to be held anyway: one write, one
+      // segment, no relay loop.  `fresh` implies a known, bounded length.
+      std::string body = framing.kind == http::BodyKind::Length
+                             ? co_await ex.reader->read_exact(static_cast<size_t>(framing.length), deadline)
+                             : std::string();
+      if (fresh) {
+        auto entry = std::make_shared<CachedResponse>();
+        entry->status = resp.status;
+        entry->reason = resp.reason;
+        entry->headers = http::filtered_headers(resp, {"content-length", "age"});
+        entry->body = body;
+        entry->stored_at = monotonic();
+        entry->expires_at = entry->stored_at + fresh->ttl;
+        entry->initial_age = fresh->age;
+        cluster_.cache.put(extras.cache_key, std::move(entry));
+      }
       head += body;
       moved = body.size();
       try {
@@ -939,6 +1051,26 @@ Task<void> Proxy::tunnel(ClientConn& conn, const http::Request& req, Exchange& e
   }
 }
 
+Task<bool> Proxy::serve_cached(ClientConn& conn, const http::Request& req, const CachedResponse& cached,
+                               bool client_keepalive) {
+  http::Headers headers = cached.headers;
+  if (cached.status != 204) headers.emplace_back("Content-Length", std::to_string(cached.body.size()));
+  double age = cached.initial_age + (monotonic() - cached.stored_at);
+  headers.emplace_back("Age", std::to_string(static_cast<long long>(age)));
+  headers.emplace_back("Connection", client_keepalive ? "keep-alive" : "close");
+  if (cfg_.debug_headers) headers.emplace_back("X-Cache", "HIT");
+  headers.emplace_back("Via", "1.1 " + cfg_.server_name);
+  std::string wire = http::encode_response(cached.status, headers, cached.reason);
+  if (req.method != "HEAD") wire += cached.body;
+  try {
+    co_await conn.socket->write_all(wire, monotonic() + cfg_.timeouts.client_idle);
+  } catch (const std::exception&) {
+    co_return false;
+  }
+  metrics::BYTES_OUT.inc(req.method == "HEAD" ? 0.0 : static_cast<double>(cached.body.size()));
+  co_return client_keepalive;
+}
+
 Task<void> Proxy::send_error(ClientConn& conn, int status, const std::string& reason,
                              const std::string& request_id, bool head_only,
                              const http::Headers& extra) {
@@ -959,7 +1091,8 @@ Task<void> Proxy::send_error(ClientConn& conn, int status, const std::string& re
 // ---------------------------------------------------------------------------
 
 std::string Proxy::build_upstream_head(const http::Request& req, const http::Framing& framing,
-                                       const std::string* body, const RequestCtx& ctx) const {
+                                       const std::string* body, const RequestCtx& ctx,
+                                       const std::string& target) const {
   http::Headers headers = http::filtered_headers(
       req, {"content-length", "x-request-id", "x-forwarded-for", "x-forwarded-proto",
             "x-forwarded-host", "expect"});
@@ -999,12 +1132,28 @@ std::string Proxy::build_upstream_head(const http::Request& req, const http::Fra
   } else if (framing.kind == http::BodyKind::Length && framing.length) {
     headers.emplace_back("Content-Length", std::to_string(framing.length));
   }
-  return http::encode_request(req.method, req.target, headers);
+  return http::encode_request(req.method, target, headers);
 }
 
-std::optional<std::string> Proxy::affinity_key(const http::Request& req,
-                                               const std::string& source_ip) const {
-  const HashKeyConfig& spec = cfg_.hash_key;
+std::optional<std::string> cookie_value(const http::Request& req, std::string_view name) {
+  for (const std::string& raw : req.get_all("cookie")) {
+    std::string_view rest = raw;
+    while (!rest.empty()) {
+      size_t semi = rest.find(';');
+      std::string_view part = http::trim(rest.substr(0, semi));
+      size_t eq = part.find('=');
+      if (eq != std::string_view::npos && part.substr(0, eq) == name && eq + 1 < part.size()) {
+        return std::string(part.substr(eq + 1));
+      }
+      if (semi == std::string_view::npos) break;
+      rest.remove_prefix(semi + 1);
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<std::string> Proxy::affinity_key(const http::Request& req, const std::string& source_ip,
+                                               const HashKeyConfig& spec) const {
   if (spec.source == "client_ip") return source_ip;
   if (spec.source == "header") {
     const std::string* v = req.get(spec.name);
@@ -1012,22 +1161,7 @@ std::optional<std::string> Proxy::affinity_key(const http::Request& req,
     return std::nullopt;
   }
   if (spec.source == "path") return std::string(req.path());
-  if (spec.source == "cookie") {
-    for (const std::string& raw : req.get_all("cookie")) {
-      std::string_view rest = raw;
-      while (!rest.empty()) {
-        size_t semi = rest.find(';');
-        std::string_view part = http::trim(rest.substr(0, semi));
-        size_t eq = part.find('=');
-        if (eq != std::string_view::npos && part.substr(0, eq) == spec.name && eq + 1 < part.size()) {
-          return std::string(part.substr(eq + 1));
-        }
-        if (semi == std::string_view::npos) break;
-        rest.remove_prefix(semi + 1);
-      }
-    }
-    return std::nullopt;
-  }
+  if (spec.source == "cookie") return cookie_value(req, spec.name);
   if (spec.source == "query") {
     std::optional<std::string> v = http::query_param(req.query(), spec.name);
     if (v && !v->empty()) return v;
@@ -1065,6 +1199,12 @@ void Proxy::finish(const http::Request& req, const RequestCtx& ctx) {
                 elapsed * 1000.0);
   line += numbers;
   line += json_quote(ctx.endpoint);
+  line += ",\"route\":";
+  line += json_quote(ctx.route);
+  if (!ctx.cache.empty()) {
+    line += ",\"cache\":";
+    line += json_quote(ctx.cache);
+  }
   std::snprintf(numbers, sizeof numbers, ",\"attempts\":%d,\"hedged\":%s,\"rid\":", ctx.attempts,
                 ctx.hedged ? "true" : "false");
   line += numbers;

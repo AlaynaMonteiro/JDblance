@@ -131,10 +131,26 @@ class Endpoint {
   uint64_t total_failures = 0;
   std::string last_error;       // empty = none
   int last_status = 0;          // 0 = none
+  std::string upstream = kDefaultUpstream;
+
+  // Slow start: when the endpoint last became available after not being.
+  // -inf means it never needs warming (present since startup).
+  bool was_available = true;
+  double warm_since = -kForever;
+  // Outlier detection: counters at the last evaluation, and how many times
+  // in a row it has been ejected (each ejection lasts longer).
+  uint64_t outlier_seen_requests = 0;
+  uint64_t outlier_seen_failures = 0;
+  int outlier_ejections = 0;
 
   std::string address() const;
   // Admin- and health-wise usable, and the breaker would admit a request.
   bool selectable(double now = monotonic()) const;
+  // Share of normal traffic while warming up: min_weight rising linearly to 1
+  // over `window` seconds after warm_since.  1 when not warming.
+  double slow_start_factor(double now, double window, double min_weight) const noexcept;
+  // Opaque cookie value naming this endpoint (no backend names leak to clients).
+  std::string sticky_token() const;
 
   // Time-decayed latency estimate.  Decays toward zero while idle, so a
   // backend that was slow an hour ago is not punished forever: an idle
@@ -164,6 +180,7 @@ class Endpoint {
   Json snapshot();
 
  private:
+  mutable std::string sticky_token_;
   double ewma_ = 0.0;
   double ewma_stamp_;
   std::vector<Address> addresses_;

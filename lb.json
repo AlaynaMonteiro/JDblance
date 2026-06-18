@@ -32,6 +32,22 @@
     { "name": "backend4", "address": "backend4:5000", "weight": 1 }
   ],
 
+  // Cookie stickiness for the pool above; an empty cookie name turns it off.
+  "sticky": { "cookie": "", "max_age": 0 },
+
+  // More pools, and the rules that send traffic to them.  A request that
+  // matches no route goes to the endpoints above (the "default" upstream).
+  // Routes are tried in order; host may be "" (any), "example.com" or
+  // "*.example.com", and prefix matches whole path segments.  For example:
+  //
+  //   "upstreams": [{ "name": "api", "policy": "least_conn",
+  //                   "endpoints": [{ "name": "api1", "address": "api1:5000" }] }],
+  //   "routes": [{ "name": "api", "prefix": "/api", "upstream": "api",
+  //                "strip_prefix": true, "cache": false,
+  //                "rate_limit": { "rate": 50, "burst": 100, "key": "header:X-Api-Key" } }],
+  "upstreams": [],
+  "routes": [],
+
   "health": {
     "enabled": true,
     "path": "/health",
@@ -111,12 +127,37 @@
   },
 
   "log": {
-    // Buffered, but still ~10% of a worker's peak throughput; set "sample"
+    // Buffered; costs a few percent of a worker's peak throughput.  Set "sample"
     // below 1.0 to keep slow requests (>= slow_request seconds) and drop the rest.
     "access": true,
     "sample": 1.0,
     "level": "info",
     "slow_request": 1.0
+  },
+
+  // A backend that joins or comes back ramps from min_weight to its full
+  // share of traffic over `window` seconds instead of taking it all at once.
+  "slow_start": { "window": 10.0, "min_weight": 0.1 },
+
+  // Eject a backend whose success rate falls well below its peers', even
+  // while it stays under the breaker's own thresholds.
+  "outlier": {
+    "enabled": true,
+    "interval": 10.0,
+    "min_requests": 20,
+    "min_hosts": 3,
+    "stdev_factor": 1.9,
+    "min_gap": 0.1,
+    "base_ejection": 30.0,
+    "max_ejection_percent": 0.5
+  },
+
+  // Shared cache for responses the origin marks as cacheable
+  // (Cache-Control: max-age / s-maxage).  The demo origins send none.
+  "cache": {
+    "enabled": false,
+    "max_bytes": 67108864,
+    "max_object_bytes": 1048576
   },
 
   // Below this fraction of healthy endpoints, stop trusting health checks and

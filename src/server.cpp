@@ -168,7 +168,8 @@ int Worker::run(int listen_fd) {
     cluster_.start_health();
     log::info("worker " + std::to_string(worker_id_) + " serving " + cfg_.listen.host + ":" +
               std::to_string(listener->local_port()) + " -> " +
-              std::to_string(cluster_.endpoints().size()) + " endpoints (" + cfg_.policy + ")");
+              std::to_string(cluster_.endpoints().size()) + " endpoints in " +
+              std::to_string(cluster_.upstreams().size()) + " upstreams (" + cluster_.primary().balancer().name() + ")");
     loop_.run_until_complete(serve(listener));
   } catch (const std::exception& e) {
     log::error("worker " + std::to_string(worker_id_) + ": " + e.what());
@@ -500,7 +501,11 @@ int main_cli(int argc, char** argv) {
   }
 
   if (check) {
-    std::printf("config OK: %zu endpoints, policy=%s\n", cfg.endpoints.size(), cfg.policy.c_str());
+    size_t endpoints = 0;
+    std::vector<UpstreamConfig> pools = cfg.all_upstreams();
+    for (const UpstreamConfig& up : pools) endpoints += up.endpoints.size();
+    std::printf("config OK: %zu endpoints in %zu upstreams, %zu routes, policy=%s\n", endpoints, pools.size(),
+                cfg.routes.size(), cfg.policy.c_str());
     return 0;
   }
   std::printf(kBanner, kVersion);

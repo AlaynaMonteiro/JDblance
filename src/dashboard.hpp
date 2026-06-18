@@ -51,7 +51,7 @@ canvas{width:100%;height:70px;display:block}
   <div class="row" id="stats"></div>
   <div class="stat"><div class="k">requests / sec</div><canvas id="spark"></canvas></div>
   <table id="endpoints"><thead><tr>
-    <th>endpoint</th><th>address</th><th>state</th><th>breaker</th><th>in flight</th>
+    <th>endpoint</th><th>upstream</th><th>address</th><th>state</th><th>breaker</th><th>in flight</th>
     <th>ewma</th><th>idle conns</th><th>requests</th><th>failures</th><th>weight</th><th></th>
   </tr></thead><tbody></tbody></table>
 </main>
@@ -124,7 +124,7 @@ async function refresh(){
                 : e.healthy ? ['up','up'] : ['down','down'];
     const bs = e.breaker.state, bcls = bs==='closed'?'up':bs==='open'?'down':'half';
     return `<tr>
-      <td>${e.name}</td><td>${e.address}</td>
+      <td>${e.name}</td><td>${e.upstream}</td><td>${e.address}</td>
       <td><span class="pill ${state[0]}">${state[1]}</span></td>
       <td><span class="pill ${bcls}">${bs}</span></td>
       <td>${e.in_flight}<div class="bar"><i style="width:${e.in_flight/maxLoad*100}%"></i></div></td>

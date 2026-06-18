@@ -142,6 +142,11 @@ extern Gauge CONCURRENCY_RTT_NOLOAD;
 extern Counter UPGRADES;
 extern Counter TUNNEL_BYTES;
 extern Counter CONFIG_RELOADS;
+extern Counter ROUTE_REQUESTS;
+extern Counter OUTLIER_EJECTIONS;
+extern Counter CACHE;   // result = hit | miss | store | evict
+extern Gauge CACHE_BYTES;
+extern Gauge CACHE_ENTRIES;
 
 // Drop every per-endpoint gauge for an endpoint that left the config.
 void forget_endpoint(const std::string& name);

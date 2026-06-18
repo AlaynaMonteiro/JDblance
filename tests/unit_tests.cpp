@@ -19,8 +19,10 @@
 #include "loop.hpp"
 #include "metrics.hpp"
 #include "origin.hpp"
+#include "routing.hpp"
 #include "server.hpp"
 #include "testing.hpp"
+#include "upstream.hpp"
 
 using namespace jdblance;
 
@@ -893,4 +895,309 @@ TEST(metrics, histogram_quantile) {
 
 TEST(origin, html_escape) {
   CHECK_EQ(html_escape("<a href=\"x\">'&'</a>"), std::string("&lt;a href=&quot;x&quot;&gt;&#39;&amp;&#39;&lt;/a&gt;"));
+}
+
+// ---------------------------------------------------------------------------
+// Routing
+// ---------------------------------------------------------------------------
+
+TEST(routing, host_patterns) {
+  CHECK(route_host_matches("", "anything.test"));
+  CHECK(route_host_matches("example.com", "example.com"));
+  CHECK(!route_host_matches("example.com", "www.example.com"));
+  CHECK(route_host_matches("*.example.com", "api.example.com"));
+  CHECK(route_host_matches("*.example.com", "a.b.example.com"));
+  CHECK(!route_host_matches("*.example.com", "example.com"));      // the apex is not a subdomain
+  CHECK(!route_host_matches("*.example.com", "evilexample.com"));  // suffix must start at a dot
+}
+
+TEST(routing, prefix_matches_whole_segments) {
+  CHECK(route_prefix_matches("/", "/anything"));
+  CHECK(route_prefix_matches("/api", "/api"));
+  CHECK(route_prefix_matches("/api", "/api/users"));
+  CHECK(!route_prefix_matches("/api", "/apix"));
+  CHECK(!route_prefix_matches("/api", "/ap"));
+  CHECK(route_prefix_matches("/api/", "/api/users"));
+  CHECK(!route_prefix_matches("/api/", "/api"));
+}
+
+TEST(routing, strip_prefix_keeps_a_valid_target) {
+  CHECK_EQ(strip_route_prefix("/api/users?id=1", "/api"), std::string("/users?id=1"));
+  CHECK_EQ(strip_route_prefix("/api", "/api"), std::string("/"));
+  CHECK_EQ(strip_route_prefix("/api?x=1", "/api"), std::string("/?x=1"));
+  CHECK_EQ(strip_route_prefix("/api/users", "/api/"), std::string("/users"));
+  CHECK_EQ(strip_route_prefix("/other", "/api"), std::string("/other"));
+  CHECK_EQ(strip_route_prefix("/x", "/"), std::string("/x"));
+}
+
+TEST(routing, request_host_is_normalised) {
+  CHECK_EQ(request_host(parse_request("GET / HTTP/1.1\r\nHost: Shop.Example.COM:8000\r\n\r\n")),
+           std::string("shop.example.com"));
+  CHECK_EQ(request_host(parse_request("GET / HTTP/1.1\r\nHost: [::1]:8000\r\n\r\n")), std::string("[::1]"));
+  CHECK_EQ(request_host(parse_request("GET / HTTP/1.0\r\n\r\n")), std::string(""));
+}
+
+// ---------------------------------------------------------------------------
+// Response cache
+// ---------------------------------------------------------------------------
+
+namespace {
+std::optional<Freshness> freshness_of(const std::string& head, const char* method = "GET") {
+  http::Response r = parse_response(head + "\r\n");
+  return response_freshness(r, http::response_framing(method, r));
+}
+
+bool may_use_cache(const std::string& raw) {
+  http::Request r = parse_request(raw);
+  return request_may_use_cache(r, http::request_framing(r));
+}
+}  // namespace
+
+TEST(cache, which_requests_may_use_it) {
+  CHECK(may_use_cache("GET /a HTTP/1.1\r\nHost: x\r\n\r\n"));
+  CHECK(may_use_cache("HEAD /a HTTP/1.1\r\nHost: x\r\n\r\n"));
+  CHECK(!may_use_cache("POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n"));
+  CHECK(!may_use_cache("GET /a HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer t\r\n\r\n"));
+  CHECK(!may_use_cache("GET /a HTTP/1.1\r\nHost: x\r\nRange: bytes=0-1\r\n\r\n"));
+  CHECK(!may_use_cache("GET /a HTTP/1.1\r\nHost: x\r\nCache-Control: no-cache\r\n\r\n"));
+  CHECK(!may_use_cache("GET /a HTTP/1.1\r\nHost: x\r\nCache-Control: max-age=0, no-store\r\n\r\n"));
+  CHECK(!may_use_cache("GET /a HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabc"));
+}
+
+TEST(cache, which_responses_may_be_stored) {
+  std::optional<Freshness> f = freshness_of("HTTP/1.1 200 OK\r\nCache-Control: public, max-age=60\r\nContent-Length: 0\r\n");
+  CHECK(f.has_value());
+  CHECK_EQ(f->ttl, 60.0);
+  // s-maxage wins over max-age for a shared cache; Age is subtracted.
+  f = freshness_of("HTTP/1.1 200 OK\r\nCache-Control: max-age=60, s-maxage=\"30\"\r\nAge: 10\r\nContent-Length: 0\r\n");
+  CHECK(f && f->ttl == 20.0 && f->age == 10.0);
+  CHECK(freshness_of("HTTP/1.1 204 No Content\r\nCache-Control: max-age=5\r\n").has_value());
+  for (const char* bad : {
+           "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n",                                       // no lifetime
+           "HTTP/1.1 200 OK\r\nCache-Control: max-age=60, private\r\nContent-Length: 0\r\n",
+           "HTTP/1.1 200 OK\r\nCache-Control: no-store, max-age=60\r\nContent-Length: 0\r\n",
+           "HTTP/1.1 200 OK\r\nCache-Control: no-cache\r\nCache-Control: max-age=60\r\nContent-Length: 0\r\n",
+           "HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nSet-Cookie: a=b\r\nContent-Length: 0\r\n",
+           "HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nVary: Accept\r\nContent-Length: 0\r\n",
+           "HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nTransfer-Encoding: chunked\r\n",   // unsized
+           "HTTP/1.1 500 Oops\r\nCache-Control: max-age=60\r\nContent-Length: 0\r\n",
+           "HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nAge: 60\r\nContent-Length: 0\r\n",  // already stale
+           "HTTP/1.1 200 OK\r\nCache-Control: max-age=-1\r\nContent-Length: 0\r\n",
+       }) {
+    if (freshness_of(bad)) testing::fail(__FILE__, __LINE__, std::string("stored: ") + bad);
+  }
+}
+
+TEST(cache, lru_by_bytes_and_expiry) {
+  ResponseCache cache;
+  cache.configure(2000, 1000);
+  auto entry = [](size_t body, double expires) {
+    auto r = std::make_shared<CachedResponse>();
+    r->body.assign(body, 'x');
+    r->expires_at = expires;
+    return r;
+  };
+  cache.put("a", entry(500, 100));
+  cache.put("b", entry(500, 100));
+  CHECK(cache.get("a", 1) != nullptr);   // a is now most recently used
+  cache.put("c", entry(900, 100));       // over budget: evicts b, the least recently used
+  CHECK(cache.get("b", 1) == nullptr);
+  CHECK(cache.get("a", 1) != nullptr);
+  CHECK(cache.get("c", 1) != nullptr);
+  CHECK(cache.bytes() <= 2000);
+  cache.put("huge", entry(1500, 100));   // larger than max_object_bytes: never stored
+  CHECK(cache.get("huge", 1) == nullptr);
+  CHECK(cache.get("a", 100) == nullptr); // expired, and dropped
+  CHECK_EQ(cache.size(), 1u);
+  cache.configure(0, 0);                 // disabling empties it
+  CHECK_EQ(cache.size(), 0u);
+}
+
+// ---------------------------------------------------------------------------
+// Upstreams: slow start, stickiness, outlier detection
+// ---------------------------------------------------------------------------
+
+namespace {
+Config upstream_config(int endpoints, const std::string& extra = "") {
+  std::string list;
+  for (int i = 0; i < endpoints; ++i) {
+    list += (i ? "," : "") + std::string("{\"name\": \"e") + std::to_string(i) +
+            "\", \"address\": \"127.0.0.1:" + std::to_string(9000 + i) + "\"}";
+  }
+  return Config::from_text("{\"endpoints\": [" + list + "]" + (extra.empty() ? "" : ", " + extra) + "}");
+}
+
+std::unique_ptr<Upstream> build_upstream(const Config& cfg) {
+  auto up = std::make_unique<Upstream>(kDefaultUpstream);
+  up->apply(cfg.all_upstreams()[0], cfg, {});
+  return up;
+}
+
+void feed(Endpoint& e, int requests, int failures) {
+  e.total_requests += static_cast<uint64_t>(requests);
+  e.total_failures += static_cast<uint64_t>(failures);
+}
+}  // namespace
+
+TEST(slow_start, factor_ramps_linearly_from_the_floor) {
+  Endpoint e("a", "127.0.0.1", 1);
+  CHECK_EQ(e.slow_start_factor(100, 10, 0.1), 1.0);   // never warming
+  e.warm_since = 100;
+  CHECK_EQ(e.slow_start_factor(100, 10, 0.1), 0.1);   // floor
+  CHECK(std::fabs(e.slow_start_factor(105, 10, 0.1) - 0.5) < 1e-9);
+  CHECK_EQ(e.slow_start_factor(110, 10, 0.1), 1.0);
+  CHECK_EQ(e.slow_start_factor(105, 0, 0.1), 1.0);    // disabled
+}
+
+TEST(slow_start, warming_endpoint_gets_a_reduced_share) {
+  Config cfg = upstream_config(4, R"("policy": "round_robin", "slow_start": {"window": 10, "min_weight": 0.1})");
+  auto up = build_upstream(cfg);
+  double now = monotonic();
+  up->endpoints()[0]->warm_since = now - 1;   // 10% of its normal share
+  std::map<std::string, int> picks;
+  for (int i = 0; i < 4000; ++i) ++picks[up->select(std::nullopt, {}, "", now)->name];
+  CHECK(picks["e0"] > 20 && picks["e0"] < 250);   // ~100 expected; 1000 without slow start
+  // The declined share is spread evenly: re-asking round robin would starve
+  // whichever endpoint follows e0 in the rotation (e1 got ~500, the others ~1700).
+  for (const char* name : {"e1", "e2", "e3"}) CHECK(picks[name] > 1150 && picks[name] < 1450);
+}
+
+TEST(slow_start, endpoint_that_comes_back_starts_warming) {
+  Config cfg = upstream_config(3, R"("slow_start": {"window": 30})");
+  auto up = build_upstream(cfg);
+  EndpointPtr e = up->endpoints()[1];
+  CHECK_EQ(e->warm_since, -kForever);         // present since startup: no warm-up
+  e->healthy = false;
+  up->candidates(monotonic());
+  e->healthy = true;
+  double back = monotonic();
+  up->candidates(back);
+  CHECK_EQ(e->warm_since, back);
+  CHECK(e->slow_start_factor(back + 3, 30, 0.1) < 0.2);
+}
+
+TEST(slow_start, hash_policies_keep_affinity) {
+  Config cfg = upstream_config(4, R"("policy": "maglev", "slow_start": {"window": 10})");
+  auto up = build_upstream(cfg);
+  EndpointPtr owner = up->select(std::string("user-42"), {});
+  owner->warm_since = monotonic();
+  for (int i = 0; i < 50; ++i) CHECK(up->select(std::string("user-42"), {}) == owner);
+}
+
+TEST(sticky, preferred_endpoint_wins_while_usable) {
+  Config cfg = upstream_config(3, R"("policy": "round_robin")");
+  auto up = build_upstream(cfg);
+  EndpointPtr wanted = up->endpoints()[2];
+  CHECK_EQ(wanted->sticky_token().size(), 16u);
+  CHECK(wanted->sticky_token() != up->endpoints()[0]->sticky_token());
+  for (int i = 0; i < 10; ++i) CHECK(up->select(std::nullopt, {}, wanted->sticky_token()) == wanted);
+  CHECK(up->find_by_token(wanted->sticky_token()) == wanted);
+  wanted->admin_enabled = false;   // gone: fall back to the policy
+  CHECK(up->select(std::nullopt, {}, wanted->sticky_token()) != wanted);
+  CHECK(up->select(std::nullopt, {}, "not-a-token") != nullptr);
+}
+
+TEST(outlier, ejects_the_endpoint_far_below_its_peers) {
+  // Four hosts, one failing half its requests.  Envoy's formula (the host in
+  // its own baseline) cannot eject it: mean 0.875, stdev 0.217, so the
+  // threshold 0.875 - 1.9 * 0.217 = 0.46 is below its 0.5.
+  Config cfg = upstream_config(4, R"("outlier": {"enabled": true, "min_requests": 20, "base_ejection": 30})");
+  auto up = build_upstream(cfg);
+  const auto& eps = up->endpoints();
+  feed(*eps[0], 100, 50);
+  for (int i = 1; i < 4; ++i) feed(*eps[static_cast<size_t>(i)], 100, 1);
+  double before = metrics::OUTLIER_EJECTIONS.value({"e0"});
+  double now = monotonic();
+  up->detect_outliers(now);
+  CHECK(eps[0]->breaker.state() == BreakerState::Open);
+  CHECK_EQ(eps[0]->outlier_ejections, 1);
+  CHECK_EQ(metrics::OUTLIER_EJECTIONS.value({"e0"}), before + 1);
+  for (int i = 1; i < 4; ++i) CHECK(eps[static_cast<size_t>(i)]->breaker.state() == BreakerState::Closed);
+  CHECK(!eps[0]->selectable(now + 29));
+  CHECK(eps[0]->selectable(now + 31));   // ejection lasts base_ejection, then half-open
+}
+
+TEST(outlier, ignores_small_gaps_low_volume_and_small_fleets) {
+  Config cfg = upstream_config(4, R"("outlier": {"enabled": true, "min_requests": 20, "min_gap": 0.1})");
+  auto up = build_upstream(cfg);
+  const auto& eps = up->endpoints();
+  feed(*eps[0], 100, 3);   // 97% next to perfect peers: zero stdev, but a 3-point gap
+  for (int i = 1; i < 4; ++i) feed(*eps[static_cast<size_t>(i)], 100, 0);
+  up->detect_outliers(monotonic());
+  CHECK(eps[0]->breaker.state() == BreakerState::Closed);
+
+  feed(*eps[0], 10, 10);   // terrible, but only 10 requests this interval
+  for (int i = 1; i < 4; ++i) feed(*eps[static_cast<size_t>(i)], 100, 0);
+  up->detect_outliers(monotonic());
+  CHECK(eps[0]->breaker.state() == BreakerState::Closed);
+
+  feed(*eps[0], 100, 100);  // only two hosts have enough volume: below min_hosts
+  feed(*eps[1], 100, 0);
+  up->detect_outliers(monotonic());
+  CHECK(eps[0]->breaker.state() == BreakerState::Closed);
+}
+
+TEST(outlier, never_ejects_more_than_the_cap) {
+  Config cfg = upstream_config(8, R"("outlier": {"enabled": true, "min_requests": 20, "max_ejection_percent": 0.1})");
+  auto up = build_upstream(cfg);
+  const auto& eps = up->endpoints();
+  feed(*eps[0], 100, 100);
+  feed(*eps[1], 100, 100);
+  for (size_t i = 2; i < 8; ++i) feed(*eps[i], 100, 0);
+  up->detect_outliers(monotonic());
+  int open = 0;
+  for (const auto& e : eps) open += e->breaker.state() == BreakerState::Open;
+  CHECK_EQ(open, 1);   // 10% of 8 rounds to 0, but one is always allowed
+}
+
+TEST(outlier, repeat_offenders_are_ejected_for_longer) {
+  Config cfg = upstream_config(4, R"("outlier": {"enabled": true, "min_requests": 20, "base_ejection": 10})");
+  auto up = build_upstream(cfg);
+  const auto& eps = up->endpoints();
+  double now = monotonic();
+  for (int round = 1; round <= 2; ++round) {
+    eps[0]->breaker.force_close();
+    feed(*eps[0], 100, 60);
+    for (int i = 1; i < 4; ++i) feed(*eps[static_cast<size_t>(i)], 100, 0);
+    up->detect_outliers(now);
+    CHECK_EQ(eps[0]->outlier_ejections, round);
+  }
+  CHECK(!eps[0]->selectable(now + 15));   // second ejection: 2 x 10 s
+  CHECK(eps[0]->selectable(now + 21));
+}
+
+TEST(config, upstreams_routes_and_new_blocks) {
+  auto err = [](const std::string& text) { return config_error(text); };
+  const std::string two = R"([{"name":"a","address":"h:1"}])";
+  CHECK_EQ(err(R"({"upstreams": [{"name": "api", "endpoints": [{"name":"x","address":"h:2"}]}],
+                   "routes": [{"name": "r", "prefix": "/api", "upstream": "api"}]})"), std::string(""));
+  CHECK(err(R"({"upstreams": [{"name": "default", "endpoints": [{"name":"x","address":"h:2"}]}]})")
+            .find("\"default\" is the top-level") != std::string::npos);
+  CHECK(err(R"({"endpoints": )" + two + R"(, "upstreams": [{"name": "api", "endpoints": [{"name":"a","address":"h:2"}]}]})")
+            .find("unique") != std::string::npos);
+  CHECK(err(R"({"endpoints": )" + two + R"(, "routes": [{"name": "r", "upstream": "nope"}]})")
+            .find("unknown upstream") != std::string::npos);
+  CHECK(err(R"({"endpoints": )" + two + R"(, "routes": [{"name": "r", "prefix": "api"}]})")
+            .find("prefix must start") != std::string::npos);
+  CHECK(err(R"({"endpoints": )" + two + R"(, "routes": [{"name": "r", "host": "Example.com"}]})")
+            .find("lower-case") != std::string::npos);
+  CHECK(err(R"({"endpoints": )" + two + R"(, "routes": [{"name": "r", "rate_limit": {"rate": 1, "key": "ip"}}]})")
+            .find("rate_limit.key") != std::string::npos);
+  CHECK(err(R"({"endpoints": )" + two + R"(, "routes": [{"name": "r"}, {"name": "r"}]})")
+            .find("route names must be unique") != std::string::npos);
+  CHECK(err(R"({"endpoints": )" + two + R"(, "sticky": {"cookie": "a b"}})").find("sticky.cookie") != std::string::npos);
+  CHECK(err(R"({"endpoints": )" + two + R"(, "slow_start": {"min_weight": 0}})").find("min_weight") != std::string::npos);
+  CHECK(err(R"({"endpoints": )" + two + R"(, "outlier": {"min_hosts": 1}})").find("min_hosts") != std::string::npos);
+  CHECK(err(R"({"endpoints": )" + two + R"(, "cache": {"max_bytes": 10, "max_object_bytes": 20}})")
+            .find("max_object_bytes") != std::string::npos);
+  CHECK(err(R"({"upstreams": []})").find("at least one endpoint") != std::string::npos);
+  // Round trip with every new block populated.
+  Config cfg = Config::from_text(R"({"endpoints": )" + two + R"(, "sticky": {"cookie": "s", "max_age": 60},
+      "upstreams": [{"name": "api", "policy": "maglev", "endpoints": [{"name":"x","address":"h:2"}]}],
+      "routes": [{"name": "r", "host": "*.ex.com", "prefix": "/api", "upstream": "api", "strip_prefix": true,
+                  "rate_limit": {"rate": 5, "burst": 10, "key": "header:X-Key"}}],
+      "cache": {"enabled": true}, "slow_start": {"window": 5}, "outlier": {"enabled": true}})");
+  CHECK_EQ(Config::from_json(cfg.to_json()).to_json().dump(), cfg.to_json().dump());
+  CHECK_EQ(cfg.all_upstreams().size(), 2u);
+  CHECK_EQ(cfg.all_upstreams()[0].sticky.cookie, std::string("s"));
 }

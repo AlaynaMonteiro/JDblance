@@ -247,6 +247,12 @@ Counter UPGRADES("jdblance_protocol_upgrades_total", "101 Switching Protocols tu
 Counter TUNNEL_BYTES("jdblance_tunnel_bytes_total", "Bytes relayed inside upgraded tunnels",
                      {"direction"});
 Counter CONFIG_RELOADS("jdblance_config_reloads_total", "SIGHUP reloads", {"result"});
+Counter ROUTE_REQUESTS("jdblance_route_requests_total", "Requests matched to each route", {"route"});
+Counter OUTLIER_EJECTIONS("jdblance_outlier_ejections_total",
+                          "Endpoints ejected for a success rate far below their peers'", {"endpoint"});
+Counter CACHE("jdblance_cache_total", "Response cache lookups and stores", {"result"});
+Gauge CACHE_BYTES("jdblance_cache_bytes", "Bytes held by the response cache", {});
+Gauge CACHE_ENTRIES("jdblance_cache_entries", "Responses held by the response cache", {});
 
 namespace {
 struct StartTime {

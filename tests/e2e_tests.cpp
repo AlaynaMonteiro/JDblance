@@ -931,3 +931,321 @@ TEST(e2e, origin_chaos_api) {
   Stack s(1);
   s.run(chaos_scenario(&s));
 }
+
+// ---------------------------------------------------------------------------
+// Routing, sticky cookies, caching, per-route limits, outliers, slow start
+// ---------------------------------------------------------------------------
+
+namespace {
+// Moves the named endpoints out of the default pool into a new upstream, adds
+// `routes`, and applies the result the way a reload would.
+void reshape(Stack& s, const std::string& upstream, const std::vector<std::string>& names,
+             const std::vector<RouteConfig>& routes, bool keep_default = true) {
+  UpstreamConfig up;
+  up.name = upstream;
+  up.policy = "round_robin";
+  std::vector<EndpointConfig> rest;
+  for (const EndpointConfig& e : s.cfg.endpoints) {
+    bool moving = std::find(names.begin(), names.end(), e.name) != names.end();
+    (moving ? up.endpoints : rest).push_back(e);
+  }
+  s.cfg.endpoints = keep_default ? rest : std::vector<EndpointConfig>{};
+  s.cfg.upstreams.push_back(up);
+  s.cfg.routes = routes;
+  s.cfg.validate();
+  s.cluster->apply_config(s.cfg);
+}
+
+RouteConfig route_to(const std::string& name, const std::string& upstream, const std::string& prefix,
+                     const std::string& host = "", bool strip = false) {
+  RouteConfig r;
+  r.name = name;
+  r.upstream = upstream;
+  r.prefix = prefix;
+  r.host = host;
+  r.strip_prefix = strip;
+  return r;
+}
+
+std::string path_seen(const http::FetchResult& r) { return Json::parse(r.body).find("path")->as_string(); }
+
+Task<void> path_routing_scenario(Stack* s) {
+  for (int i = 0; i < 6; ++i) {
+    http::FetchResult api = co_await fetch(s->port, "/api/users?id=7");
+    CHECK_EQ(api.response.status, 200);
+    CHECK_EQ(api.response.get_or("x-upstream"), std::string("b2"));
+    CHECK_EQ(path_seen(api), std::string("/users?id=7"));   // prefix stripped
+  }
+  std::set<std::string> elsewhere;
+  for (const char* path : {"/", "/apix", "/other/api", "/", "/apix", "/other"}) {
+    http::FetchResult r = co_await fetch(s->port, path);
+    CHECK_EQ(r.response.status, 200);
+    CHECK_EQ(path_seen(r), std::string(path));               // default route: untouched
+    elsewhere.insert(r.response.get_or("x-upstream"));
+  }
+  CHECK(elsewhere == (std::set<std::string>{"b0", "b1"}));
+  CHECK(metrics::ROUTE_REQUESTS.value({"api"}) >= 6);
+  CHECK(s->cluster->ready());
+  s->cluster->find("b2")->healthy = false;   // the default pool is fine, the api pool is not
+  CHECK(!s->cluster->ready());
+}
+
+Task<void> host_routing_scenario(Stack* s) {
+  http::Headers shop = {{"Host", "Shop.Example.com:8080"}};
+  http::FetchResult r = co_await fetch_with(s->port, "/", "GET", "", shop);
+  CHECK_EQ(r.response.get_or("x-upstream"), std::string("b2"));
+  http::Headers apex = {{"Host", "example.com"}};   // not a subdomain: default pool
+  r = co_await fetch_with(s->port, "/", "GET", "", apex);
+  CHECK(r.response.get_or("x-upstream") != "b2");
+}
+
+Task<void> no_default_scenario(Stack* s, AdminServer* admin) {
+  http::FetchResult miss = co_await fetch(s->port, "/");
+  CHECK_EQ(miss.response.status, 404);
+  CHECK(miss.body.find("no route") != std::string::npos);
+  http::FetchResult hit = co_await fetch(s->port, "/api");
+  CHECK_EQ(hit.response.status, 200);
+  int st = co_await status_of(admin->port(), "/readyz");
+  CHECK_EQ(st, 200);
+  // Readiness needs *every* upstream: lose the only one and it fails.
+  for (const EndpointPtr& e : s->cluster->endpoints()) e->healthy = false;
+  st = co_await status_of(admin->port(), "/readyz");
+  CHECK_EQ(st, 503);
+  Json stats = Json::parse((co_await fetch(admin->port(), "/stats")).body);
+  CHECK_EQ(stats.find("upstreams")->as_array().size(), 1u);
+  CHECK_EQ(stats.find("routes")->as_array()[0].find("upstream")->as_string(), std::string("api"));
+}
+}  // namespace
+
+TEST(e2e, path_routing_with_prefix_strip) {
+  Stack s(3, R"({"policy": "round_robin"})");
+  reshape(s, "api", {"b2"}, {route_to("api", "api", "/api", "", true)});
+  s.run(path_routing_scenario(&s));
+}
+
+TEST(e2e, host_routing_with_wildcard) {
+  Stack s(3, R"({"policy": "round_robin"})");
+  reshape(s, "shop", {"b2"}, {route_to("shop", "shop", "/", "*.example.com")});
+  s.run(host_routing_scenario(&s));
+}
+
+TEST(e2e, unmatched_request_is_404_without_a_default_pool) {
+  Stack s(2);
+  reshape(s, "api", {"b0", "b1"}, {route_to("api", "api", "/api")}, false);
+  AdminServer admin(s.cfg, *s.cluster, *s.proxy);
+  admin.start("127.0.0.1", 0);
+  s.run(no_default_scenario(&s, &admin));
+  admin.stop();
+}
+
+namespace {
+std::string cookie_from(const http::FetchResult& r, const std::string& name) {
+  std::string set = r.response.get_or("set-cookie");
+  if (set.rfind(name + "=", 0) != 0) return "";
+  return set.substr(name.size() + 1, set.find(';') - name.size() - 1);
+}
+
+Task<void> sticky_scenario(Stack* s) {
+  http::FetchResult first = co_await fetch(s->port);
+  std::string token = cookie_from(first, "jdb");
+  CHECK_EQ(token.size(), 16u);
+  CHECK(first.response.get_or("set-cookie").find("Max-Age=60") != std::string::npos);
+  CHECK(first.response.get_or("set-cookie").find("HttpOnly") != std::string::npos);
+  std::string home = first.response.get_or("x-upstream");
+  http::Headers with_cookie = {{"Cookie", "theme=dark; jdb=" + token}};
+  for (int i = 0; i < 8; ++i) {   // round robin would rotate; the cookie pins it
+    http::FetchResult r = co_await fetch_with(s->port, "/", "GET", "", with_cookie);
+    CHECK_EQ(r.response.get_or("x-upstream"), home);
+    CHECK(!r.response.has("set-cookie"));
+  }
+  s->cluster->find(home)->admin_enabled = false;   // its backend goes away
+  http::FetchResult moved = co_await fetch_with(s->port, "/", "GET", "", with_cookie);
+  CHECK_EQ(moved.response.status, 200);
+  CHECK(moved.response.get_or("x-upstream") != home);
+  std::string fresh = cookie_from(moved, "jdb");
+  CHECK(!fresh.empty() && fresh != token);   // re-pinned to the new one
+
+  // Pinned to a backend that is up but failing: the retry goes elsewhere and
+  // the client is re-pinned to wherever it succeeded.
+  std::string now_home = moved.response.get_or("x-upstream");
+  for (auto& o : s->origins) {
+    if (o->name == now_home) o->fail_rate = 1.0;
+  }
+  http::Headers repinned = {{"Cookie", "jdb=" + fresh}};
+  http::FetchResult retried = co_await fetch_with(s->port, "/", "GET", "", repinned);
+  CHECK_EQ(retried.response.status, 200);
+  CHECK_EQ(retried.response.get_or("x-attempts"), std::string("2"));
+  CHECK(retried.response.get_or("x-upstream") != now_home);
+  CHECK(!cookie_from(retried, "jdb").empty() && cookie_from(retried, "jdb") != fresh);
+}
+}  // namespace
+
+TEST(e2e, sticky_cookie_pins_and_repins) {
+  Stack s(3, R"({"policy": "round_robin", "sticky": {"cookie": "jdb", "max_age": 60}})");
+  s.run(sticky_scenario(&s));
+}
+
+namespace {
+const char* kCacheable =
+    "HTTP/1.1 200 OK\r\nCache-Control: public, max-age=60\r\nAge: 2\r\nContent-Type: text/plain\r\n"
+    "Content-Length: 5\r\n\r\nhello";
+
+Task<void> cache_scenario(Stack* s) {
+  Scripted& origin = *s->scripts[0];
+  double hits_before = metrics::CACHE.value({"hit"});
+  http::FetchResult miss = co_await fetch(s->port, "/page");
+  CHECK_EQ(miss.body, std::string("hello"));
+  CHECK_EQ(miss.response.get_or("x-cache"), std::string("MISS"));
+  CHECK_EQ(origin.requests, 1);
+
+  http::FetchResult hit = co_await fetch(s->port, "/page");
+  CHECK_EQ(hit.response.status, 200);
+  CHECK_EQ(hit.body, std::string("hello"));
+  CHECK_EQ(hit.response.get_or("x-cache"), std::string("HIT"));
+  CHECK_EQ(hit.response.get_or("content-type"), std::string("text/plain"));
+  CHECK(std::stoi(hit.response.get_or("age", "0")) >= 2);   // the origin's Age carries over
+  CHECK_EQ(origin.requests, 1);                              // served without the backend
+
+  http::FetchResult head = co_await fetch(s->port, "/page", "HEAD");
+  CHECK_EQ(head.response.get_or("x-cache"), std::string("HIT"));
+  CHECK_EQ(head.response.get_or("content-length"), std::string("5"));
+  CHECK(head.body.empty());
+
+  http::Headers no_cache = {{"Cache-Control", "no-cache"}};
+  http::FetchResult bypass = co_await fetch_with(s->port, "/page", "GET", "", no_cache);
+  CHECK(!bypass.response.has("x-cache"));
+  CHECK_EQ(origin.requests, 2);
+
+  co_await fetch(s->port, "/other");   // a different target is a different entry
+  CHECK_EQ(origin.requests, 3);
+  CHECK_EQ(s->cluster->cache.size(), 2u);
+  CHECK_EQ(metrics::CACHE.value({"hit"}), hits_before + 2);
+}
+
+Task<void> uncacheable_scenario(Stack* s) {
+  co_await fetch(s->port, "/x");
+  http::FetchResult again = co_await fetch(s->port, "/x");
+  CHECK_EQ(again.response.get_or("x-cache"), std::string("MISS"));
+  CHECK_EQ(s->scripts[0]->requests, 2);
+  CHECK_EQ(s->cluster->cache.size(), 0u);
+}
+}  // namespace
+
+TEST(e2e, cache_serves_hits_without_the_backend) {
+  Stack s(0, R"({"cache": {"enabled": true}})", {{"cached", kCacheable}});
+  s.run(cache_scenario(&s));
+}
+
+TEST(e2e, cache_never_stores_what_it_must_not) {
+  for (const char* response : {
+           "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",   // no freshness information
+           "HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nSet-Cookie: s=1\r\nContent-Length: 2\r\n\r\nok",
+           "HTTP/1.1 200 OK\r\nCache-Control: private, max-age=60\r\nContent-Length: 2\r\n\r\nok",
+           "HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nVary: Accept-Language\r\nContent-Length: 2\r\n\r\nok",
+           "HTTP/1.1 500 Oops\r\nCache-Control: max-age=60\r\nContent-Length: 2\r\n\r\nno",
+       }) {
+    Stack s(0, R"({"cache": {"enabled": true}, "retry": {"enabled": false}})", {{"origin", response}});
+    s.run(uncacheable_scenario(&s));
+  }
+}
+
+TEST(e2e, cache_respects_a_route_opt_out) {
+  Stack s(0, R"({"cache": {"enabled": true},
+                 "routes": [{"name": "fresh", "prefix": "/live", "cache": false}]})",
+          {{"cached", kCacheable}});
+  auto scenario = [](Stack* st) -> Task<void> {
+    co_await fetch(st->port, "/live/x");
+    http::FetchResult r = co_await fetch(st->port, "/live/x");
+    CHECK(!r.response.has("x-cache"));
+    CHECK_EQ(st->scripts[0]->requests, 2);
+  };
+  s.run(scenario(&s));
+}
+
+namespace {
+Task<void> route_limit_scenario(Stack* s) {
+  http::Headers alice = {{"X-Api-Key", "alice"}};
+  http::Headers bob = {{"X-Api-Key", "bob"}};
+  int st = (co_await fetch_with(s->port, "/limited", "GET", "", alice)).response.status;
+  CHECK_EQ(st, 200);
+  http::FetchResult limited = co_await fetch_with(s->port, "/limited", "GET", "", alice);
+  CHECK_EQ(limited.response.status, 429);
+  CHECK_EQ(limited.response.get_or("retry-after"), std::string("1"));
+  st = (co_await fetch_with(s->port, "/limited", "GET", "", bob)).response.status;
+  CHECK_EQ(st, 200);   // its own bucket
+  st = (co_await fetch(s->port, "/limited")).response.status;   // no key: the client IP's bucket
+  CHECK_EQ(st, 200);
+  st = (co_await fetch(s->port, "/limited")).response.status;
+  CHECK_EQ(st, 429);
+  for (int i = 0; i < 5; ++i) {   // other routes are not limited
+    st = (co_await fetch(s->port, "/free")).response.status;
+    CHECK_EQ(st, 200);
+  }
+  CHECK(metrics::SHED.value({"route_rate_limit"}) >= 2);
+}
+}  // namespace
+
+TEST(e2e, per_route_rate_limit_by_header) {
+  Stack s(2, R"({"routes": [{"name": "limited", "prefix": "/limited",
+                             "rate_limit": {"rate": 0.5, "burst": 1, "key": "header:X-Api-Key"}}]})");
+  s.run(route_limit_scenario(&s));
+}
+
+namespace {
+Task<void> outlier_scenario(Stack* s) {
+  s->origins[0]->fail_rate = 0.6;
+  double before = metrics::OUTLIER_EJECTIONS.value({"b0"});
+  // Paced traffic across three 0.2 s intervals (~25 requests each, ~6 of them
+  // b0's), so every interval the lazy evaluation lands on has enough samples.
+  // Paced, not a tight loop: thousands of short connections per run exhaust
+  // the ephemeral ports and time out every test after it.
+  for (int i = 0; i < 80; ++i) {
+    co_await fetch(s->port);
+    co_await sleep_for(0.008);
+  }
+  CHECK_EQ(metrics::OUTLIER_EJECTIONS.value({"b0"}), before + 1);   // once: it stays out for 30 s
+  CHECK(s->cluster->find("b0")->breaker.state() == BreakerState::Open);
+  for (int i = 0; i < 12; ++i) {
+    http::FetchResult r = co_await fetch(s->port);
+    CHECK_EQ(r.response.status, 200);
+    CHECK(r.response.get_or("x-upstream") != "b0");
+  }
+}
+}  // namespace
+
+TEST(e2e, outlier_detection_ejects_a_degraded_backend) {
+  // The breaker alone can never trip here (a 100% error-rate threshold and an
+  // unreachable streak), so only the comparison with the peers can catch b0.
+  Stack s(4, R"({"policy": "round_robin", "retry": {"enabled": false},
+                 "breaker": {"error_threshold": 1.0, "consecutive_failures": 1000},
+                 "outlier": {"enabled": true, "interval": 0.2, "min_requests": 3, "base_ejection": 30}})");
+  s.run(outlier_scenario(&s));
+}
+
+namespace {
+Task<void> slow_start_scenario(Stack* s, AdminServer* admin) {
+  std::map<std::string, int> seen;
+  for (int i = 0; i < 200; ++i) ++seen[(co_await fetch(s->port)).response.get_or("x-upstream")];
+  CHECK(seen["b3"] < 30);   // ~5 expected while warming; ~50 at full weight
+  // The others keep their full round-robin share and absorb b3's remainder,
+  // spread by latency rather than by the rotation.
+  for (const char* name : {"b0", "b1", "b2"}) CHECK(seen[name] >= 45);
+  Json stats = Json::parse((co_await fetch(admin->port(), "/stats")).body);
+  const Json& warming = *stats.find("upstreams")->as_array()[0].find("warming");
+  CHECK_EQ(warming.as_array().size(), 1u);
+  CHECK_EQ(warming.as_array()[0].as_string(), std::string("b3"));
+}
+}  // namespace
+
+TEST(e2e, slow_start_ramps_an_endpoint_added_by_reload) {
+  Stack s(4, R"({"policy": "round_robin", "slow_start": {"window": 60, "min_weight": 0.1}})");
+  EndpointConfig b3 = s.cfg.endpoints.back();
+  s.cfg.endpoints.pop_back();
+  s.cluster->apply_config(s.cfg);   // b3 leaves...
+  s.cfg.endpoints.push_back(b3);
+  s.cluster->apply_config(s.cfg);   // ...and comes back as a new endpoint: it warms up
+  AdminServer admin(s.cfg, *s.cluster, *s.proxy);
+  admin.start("127.0.0.1", 0);
+  s.run(slow_start_scenario(&s, &admin));
+  admin.stop();
+}

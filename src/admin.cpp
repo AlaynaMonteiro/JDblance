@@ -124,15 +124,18 @@ AdminServer::Reply AdminServer::route(const http::Request& req) {
     }
     if (path == "/healthz") return {200, "{\"status\":\"ok\"}\n", kJson};
     if (path == "/readyz") {
-      size_t usable = cluster_.usable();
       Json body = Json::object();
       if (proxy_.draining()) {
         body["status"] = "draining";
         return json_reply(503, body);
       }
-      body["status"] = usable ? "ready" : "no_upstreams";
-      body["healthy"] = usable;
-      return json_reply(usable ? 200 : 503, body);
+      // Every upstream must have a usable endpoint and none may be in panic:
+      // an instance that can only serve some routes, or only by spraying
+      // traffic at backends that look unhealthy, should leave the rotation.
+      bool ready = cluster_.ready();
+      body["status"] = ready ? "ready" : "not_ready";
+      body["healthy"] = cluster_.usable();
+      return json_reply(ready ? 200 : 503, body);
     }
     if (path == "/stats") return json_reply(200, stats());
     if (path == "/config") return {200, cfg_.to_json().dump(2) + "\n", kJson};

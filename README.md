@@ -4,8 +4,11 @@ JDblance is an HTTP/1.1 reverse proxy and load balancer written in **C++20**.
 It needs **nothing but a C++ compiler and `make`**. Beyond spreading requests
 across backends, it runs the feedback loops that keep a fleet standing under
 stress: it learns its own concurrency limit, sheds load based on queueing
-delay, ejects failing backends, races slow requests against a second backend,
-caps retries with a budget, and keeps sessions sticky with consistent hashing.
+delay, ejects failing backends and statistical outliers, eases recovered
+backends back in, races slow requests against a second backend, and caps
+retries with a budget. It routes by host and path to separate backend pools,
+keeps sessions sticky with consistent hashing or cookies, and caches responses
+the origin marks as cacheable.
 
 For comparison, the Docker stack also runs a tuned nginx on `:8080` in front of
 the same backends.
@@ -59,13 +62,15 @@ P2C sends it work again once it looks cheap enough.
 | | |
 |---|---|
 | **HTTP** | HTTP/1.1 keep-alive to clients and backends, chunked bodies, `Expect: 100-continue`, WebSocket and other `Connection: Upgrade` tunnels with half-close, HTTP/1.0 clients, strict message framing |
-| **Routing policies** | round robin · smooth weighted round robin · random · least connections · **P2C with peak EWMA** · bounded-load consistent hashing · **Maglev** |
-| **Health** | active probes with rise/fall thresholds and jitter; passive circuit breakers with exponential backoff and half-open probing |
-| **Overload protection** | adaptive concurrency limit (gradient algorithm), CoDel admission queue that switches to LIFO, per-IP token buckets, a connection cap |
+| **Request routing** | host (exact or `*.example.com`) and path-prefix routes to named backend pools, each with its own policy; optional prefix stripping |
+| **Balancing policies** | round robin · smooth weighted round robin · random · least connections · **P2C with peak EWMA** · bounded-load consistent hashing · **Maglev** · cookie-based sticky sessions |
+| **Health** | active probes with rise/fall thresholds and jitter; passive circuit breakers with exponential backoff and half-open probing; **success-rate outlier detection**; **slow start** for backends that join or recover |
+| **Overload protection** | adaptive concurrency limit (gradient algorithm), CoDel admission queue that switches to LIFO, per-IP token buckets, **per-route rate limits** keyed by client IP or by a header such as an API key, a connection cap |
+| **Caching** | in-memory LRU cache for responses marked cacheable by `Cache-Control`, served without touching a backend or an admission slot |
 | **Tail latency** | hedged requests timed from the live p99, pooled upstream connections, `TCP_NODELAY` on every socket |
 | **Safety** | retry budget, buffered request bodies so retries are possible, idempotency-aware replay, panic mode, a parser built to resist request smuggling |
 | **Operations** | live admin API and dashboard; drain, enable, disable and re-weight backends at runtime; reload on `SIGHUP`; graceful drain on `SIGTERM` |
-| **Observability** | 30+ Prometheus metrics, per-request JSON access logs with request IDs, a ready-made Grafana dashboard, alert rules |
+| **Observability** | 35+ Prometheus metrics, per-request JSON access logs with request IDs, a ready-made Grafana dashboard, alert rules |
 | **Multi-core** | one process per core sharing a port through `SO_REUSEPORT`, with a supervisor that restarts crashed workers |
 | **Dependencies** | none: a C++20 compiler (tested with GCC 13) and `make`, on Linux |
 
@@ -107,6 +112,15 @@ the test suite covers every one of them.
   and at startup the soft `RLIMIT_NOFILE` is raised to the hard limit.
 - **`/readyz` is honest.** Readiness reports failure in panic mode, while
   traffic is being spread over a fleet that mostly looks unhealthy.
+- **Small fleets can still eject an outlier.** Each backend's success rate is
+  compared with the mean and spread of its *peers*, not of a group that
+  includes itself. Including it (Envoy's formula) drags the mean down and the
+  spread up so much that, with fewer than five backends, even one failing
+  every request never falls below `mean - 1.9 × stdev`.
+- **The cache can't serve the wrong response.** Responses with `Vary`,
+  `Set-Cookie`, `private`, `no-store` or `no-cache` are never stored, and
+  requests with `Authorization`, `Range` or a client `no-cache` never read from
+  it.
 - Tunnels time out on inactivity rather than total lifetime, so long-running
   WebSockets stay up, and a half-close is passed through in either direction.
 - Breaker windows roll forward correctly after long quiet periods, so the
@@ -115,6 +129,18 @@ the test suite covers every one of them.
   a 1.0 request without `Host` gets one added before forwarding, and a
   connection from a 1.0 origin that closes by default is never put back in the
   pool.
+- **Slow start doesn't starve a neighbour.** When a warming endpoint's turn is
+  declined, the replacement is chosen by a stateless P2C rather than by asking
+  the policy again. Asking round robin again correlates its counter with the
+  rejection, and in testing the endpoint next in the rotation got a third of
+  the traffic of the others.
+- **A sticky cookie never pins a client to a failure.** The cookie's backend is
+  preferred only on the first attempt and only while it is usable; a retry, or
+  a client whose backend has gone away, is balanced normally and re-pinned to
+  wherever it lands.
+- **Readiness covers every pool.** With several upstreams, `/readyz` fails if
+  any of them has no usable endpoint or is in panic mode, since some of the
+  routes would then fail.
 
 **Hardening**
 
@@ -160,8 +186,10 @@ flowchart LR
     subgraph DP["per-request path"]
         direction TB
         P["strict HTTP/1.1 parsing"] --> R["per-IP token bucket"]
-        R --> A["admission · gradient limit + CoDel queue"]
-        A --> S["choose a backend · P2C peak-EWMA or Maglev"]
+        R --> RT["route · host + path prefix → upstream, per-route limit"]
+        RT --> CH["response cache · a hit ends here"]
+        CH --> A["admission · gradient limit + CoDel queue"]
+        A --> S["choose a backend · policy, sticky cookie, slow start, outliers"]
         S --> X["send on a pooled keep-alive connection"]
         X --> Y["retry within budget · hedge at p99"]
     end
@@ -198,6 +226,8 @@ they run on short-lived threads and hand their results back through an
 | [`src/hashring.cpp`](src/hashring.cpp) | BLAKE2b, the Maglev lookup table and the bounded-load hash ring |
 | [`src/endpoint.cpp`](src/endpoint.cpp) | state kept for each backend: breaker, latency EWMA, connection pool |
 | [`src/limits.cpp`](src/limits.cpp) | token buckets, retry budget, gradient limiter, CoDel queue |
+| [`src/upstream.cpp`](src/upstream.cpp) | one backend pool: selection, slow start, outlier detection, sticky preference |
+| [`src/routing.cpp`](src/routing.cpp) | host and prefix matching, cacheability rules, the LRU response cache |
 | [`src/health.cpp`](src/health.cpp) | active health checks |
 | [`src/server.cpp`](src/server.cpp) | worker processes, supervisor, signal handling, graceful drain, reload, command line |
 | [`src/admin.cpp`](src/admin.cpp) | admin API and dashboard |
@@ -218,7 +248,7 @@ and `make`:
 ```bash
 make            # build the five binaries into build/
 make demo       # origins, balancer and fault script together in one process
-make test       # 100 unit and end-to-end tests, then the process smoke test
+make test       # 127 unit and end-to-end tests, then the process smoke test
 ```
 
 To run it locally as separate processes:
@@ -415,6 +445,107 @@ before the next read begins, so backpressure reaches all the way back to the
 sender. When a small response arrives in one piece together with its headers,
 it goes to the client in one write.
 
+### Warming up backends that join or recover
+
+A backend that has just started, or just come back from an outage, often
+answers slowly at first: cold caches, an unwarmed JIT, empty connection pools.
+Giving it a full share of traffic straight away can knock it over again. With
+`slow_start.window` set, an endpoint added by a reload, or one that becomes
+available again after a failed health check, a breaker trip or being disabled,
+gets a share of traffic that grows linearly from `min_weight` (10% by default)
+to 100% over the window ([`src/upstream.cpp`](src/upstream.cpp)).
+
+It works with every policy without each one knowing about it. The policy picks
+as usual; if it picked a warming endpoint, the pick is kept with probability
+equal to the current share, and otherwise a stateless P2C picks among the
+rest. Hash policies are exempt, because diverting a key would break the
+affinity that is the reason for choosing them. Backends present at startup
+don't warm up, since nothing has seen them yet.
+
+### Ejecting outliers by comparing with peers
+
+A breaker trips on a *fixed* threshold, such as 50% errors. A backend failing
+20% of requests while its peers fail none is clearly broken, but it never
+reaches that threshold. Outlier detection catches it by comparison instead.
+Every `interval` (10 s), each endpoint that served at least `min_requests` in
+it is compared with the others that did. It is ejected when its success rate
+is below their mean by more than `stdev_factor` (1.9) standard deviations
+*and* by more than `min_gap` (10 points). The second condition stops a backend
+at 98% from being ejected next to peers at exactly 100%, where the spread is
+zero.
+
+The comparison is leave-one-out: the mean and spread come from the *other*
+endpoints. Envoy's formula includes the endpoint being judged, and in a small
+fleet that hides it. With four backends where one fails every request, the
+mean is 0.75 and the spread 0.43, so the threshold of 0.75 − 1.9 × 0.43 is
+below zero and nothing is ejected. Leave-one-out compares it with peers at 100%
+and ejects it.
+
+An ejection opens the endpoint's breaker for `base_ejection` × (times ejected
+in a row), up to 10×, and the breaker's half-open probe brings it back. At
+most `max_ejection_percent` of an upstream can be ejected at once, though one
+always can be. The check runs lazily from the selection path once per
+interval, so it needs no timer, and an upstream with no traffic has nothing to
+judge anyway.
+
+### Routing to separate pools
+
+The top-level `endpoints` form the upstream called `default`. `upstreams` adds
+more named pools, each with its own policy, hash key and sticky-cookie
+settings, and `routes` decides which pool a request goes to
+([`src/routing.cpp`](src/routing.cpp)):
+
+```jsonc
+"upstreams": [{"name": "api", "policy": "least_conn",
+               "endpoints": [{"name": "api1", "address": "10.0.0.5:8080"}]}],
+"routes": [
+  {"name": "api", "prefix": "/api", "upstream": "api", "strip_prefix": true,
+   "rate_limit": {"rate": 50, "burst": 100, "key": "header:X-Api-Key"}},
+  {"name": "shop", "host": "*.shop.example", "upstream": "api"}
+]
+```
+
+Routes are tried in order and the first match wins. `host` is empty (any
+host), an exact name, or `*.example.com` for any subdomain; the port in the
+`Host` header is ignored. `prefix` matches whole path segments, so `/api`
+matches `/api` and `/api/users` but not `/apix`. A request that matches no
+route goes to `default`, or gets a 404 if there is no default pool.
+`strip_prefix` removes the prefix before forwarding, so `/api/users?id=7`
+reaches the backend as `/users?id=7`.
+
+A route's `rate_limit` is a token bucket per key, separate from the global
+per-IP limit. The key is the client IP, or the value of a header (an API key,
+say), falling back to the client IP when the header is missing.
+
+### Sticky sessions with cookies
+
+Hash policies keep a *key* on the same backend, but the key has to exist in
+every request. Setting `sticky.cookie` on an upstream makes the balancer create
+one instead. The first response carries a `Set-Cookie` naming the backend
+that served it, as a 16-character hash rather than its real name, marked
+`HttpOnly` and `SameSite=Lax`, with an optional `Max-Age`. Later requests with
+the cookie go to that backend while it is usable. If it isn't, because it's
+unhealthy, disabled, ejected or draining, the request is balanced normally and
+the client is pointed at its new backend. Retries ignore the cookie, because a
+retry means that backend has just failed.
+
+### Caching responses
+
+With `cache.enabled`, a GET response is stored when the origin explicitly says
+it may be (`Cache-Control: max-age` or `s-maxage`, minus any `Age` it already
+has) and it carries nothing that makes sharing it unsafe. The rules are
+conservative. A response is never stored if it has `Vary`, `Set-Cookie`,
+`private`, `no-store` or `no-cache`, if its status isn't one of 200, 203, 204,
+300, 301, 308, 404 or 410, or if its size isn't known up front. A request
+never reads from the cache if it carries `Authorization` or `Range`, or asks
+for `no-cache` / `no-store`.
+
+A hit is answered before admission, so it costs no concurrency slot and never
+touches a backend. It gets an `Age` header and, with debug headers on,
+`X-Cache: HIT`; HEAD requests are served from the stored GET. The cache is an
+LRU bounded by bytes (64 MiB by default, 1 MiB per object), one per worker. A
+route can opt out with `"cache": false`.
+
 ### Using every core with SO_REUSEPORT
 
 One event loop can only use one core. With `listen.workers > 1`, JDblance
@@ -460,29 +591,31 @@ median of three runs, and latency is corrected for coordinated omission:
 
 | target rate | workers | actual rate | p50 | p99 | p99.9 | errors |
 |---|---|---|---|---|---|---|
-| 2,000 rps | 1 | 2,007 rps | 1.47 ms | 2.0 ms | 2.5 ms | 0 |
-| 5,000 rps | 1 | 5,029 rps | 1.28 ms | 1.7 ms | 2.6 ms | 0 |
-| 10,000 rps | 1 | 9,992 rps | 1.23 ms | 1.8 ms | 3.1 ms | 0 |
-| 20,000 rps | 1 | 19,976 rps | 1.27 ms | 2.0 ms | 4.4 ms | 0 |
-| 10,000 rps | 4 | 10,024 rps | 1.25 ms | 1.6 ms | 2.7 ms | 0 |
-| 20,000 rps | 4 | 19,956 rps | 1.31 ms | 1.7 ms | 2.7 ms | 0 |
-| 40,000 rps | 4 | 40,012 rps | 2.42 ms | 23.7 ms | 37.2 ms | 0 |
+| 2,000 rps | 1 | 2,019 rps | 1.46 ms | 2.0 ms | 3.1 ms | 0 |
+| 5,000 rps | 1 | 4,986 rps | 1.27 ms | 1.6 ms | 3.2 ms | 0 |
+| 10,000 rps | 1 | 10,021 rps | 1.26 ms | 1.9 ms | 3.2 ms | 0 |
+| 20,000 rps | 1 | 19,993 rps | 1.32 ms | 3.3 ms | 6.5 ms | 0 |
+| 10,000 rps | 4 | 9,969 rps | 1.26 ms | 1.6 ms | 2.4 ms | 0 |
+| 20,000 rps | 4 | 19,938 rps | 1.39 ms | 2.0 ms | 2.7 ms | 0 |
+| 40,000 rps | 4 | 39,960 rps | 1.97 ms | 5.4 ms | 18.3 ms | 0 |
+| 60,000 rps | 4 | 59,543 rps | 8.77 ms | 43.9 ms | 47.4 ms | 0 |
 
 None of these runs returned a single error or 503.
 
-A single worker saturates at about **25k rps** on this machine: offered 30k,
-40k and 60k rps, it delivered between 23k and 26.7k (median 25.2k over nine
-runs), with latency climbing into hundreds of milliseconds as requests queue.
-Turning the access log on lowers that ceiling by roughly 10% (median 22.3k
-over six runs). Four workers kept up with 40k rps; offered 60k, they delivered
-about 52k, but at that point the single-threaded load generator and origins
-are competing with the proxy for the same 16 vCPUs, so those runs don't show
-where the proxy alone would stop.
+A single worker saturates at about **23k rps** on this machine: offered 30k,
+40k and 60k rps, it delivered between 19.5k and 23.8k (median 23.1k over nine
+runs), with latency climbing into seconds as requests queue and a handful of
+requests shed with 503. Turning the access log on costs about 4% at the same
+offered loads (median 21.5k against 22.4k, six runs each). Four workers kept
+up with 60k rps; beyond that, the single-threaded load generator and origins
+compete with the proxy for the same 16 vCPUs, so a higher rate wouldn't show
+where the proxy alone stops.
 
 Tail latency varies from run to run even on a quiet machine. Most runs kept
-p99 within a few milliseconds, but one of the three single-worker 20k runs had
-a p99 of 63 ms, and the four-worker 40k runs ranged from 8 ms to 26 ms. The
-medians above smooth that out. Treat these numbers as relative, measured on
+p99 within a few milliseconds, but one of the three single-worker 20k runs and
+one of the four-worker 40k runs each had a p99 of about 87 ms, and the
+four-worker 60k runs ranged from 20 ms to 155 ms. The medians above smooth
+that out. Treat these numbers as relative, measured on
 one machine. `make compare` sends identical open-loop load to JDblance and to
 the nginx comparison in the Docker stack, so you can measure both on your own
 hardware.
@@ -576,7 +709,7 @@ different IP is picked up.
 
 ## Metrics, logs and alerts
 
-`/metrics` exposes 30+ metrics. The request latency histogram is also where
+`/metrics` exposes 35+ metrics. The request latency histogram is also where
 the p99 used for hedging comes from:
 
 ```
@@ -590,6 +723,8 @@ jdblance_admission_sojourn_seconds_bucket     jdblance_shed_total{reason}
 jdblance_retries_total{reason}                jdblance_retry_budget_denied_total
 jdblance_hedges_total                         jdblance_hedge_wins_total
 jdblance_pool_reused_total{endpoint}          jdblance_pool_created_total{endpoint}
+jdblance_route_requests_total{route}          jdblance_outlier_ejections_total{endpoint}
+jdblance_cache_total{result}                  jdblance_cache_bytes
 ...
 ```
 
@@ -650,7 +785,7 @@ is exactly what a latency-based cost is for.
 ## Running the tests
 
 ```bash
-make test        # 100 unit and end-to-end tests, then tests/smoke.sh
+make test        # 127 unit and end-to-end tests, then tests/smoke.sh
 make asan        # the same tests built with AddressSanitizer and UndefinedBehaviorSanitizer
 ```
 
@@ -659,14 +794,21 @@ make asan        # the same tests built with AddressSanitizer and UndefinedBehav
   WRR never bursts, P2C steers away from a slow backend, under 25% of keys move
   on the ring, Maglev slots within 2%, bounded loads spill hot keys, BLAKE2b
   matches reference vectors); the arithmetic inside breakers, budgets, the
-  limiter and CoDel; config validation; JSON; and metrics output.
+  limiter and CoDel; route matching and prefix stripping; which requests and
+  responses the cache accepts, and its LRU; the slow-start ramp and the share
+  it produces; outlier ejection, its gap, volume and cap rules, and longer
+  ejections for repeat offenders; config validation; JSON; and metrics output.
 - **`tests/e2e_tests.cpp`** runs real sockets, origins and proxy inside one
   event loop: keep-alive reuse, chunked upload re-framing, `100-continue`,
   retries past dead and refusing backends, breaker ejection *and* recovery,
   POSTs not replayed once sent, the 429/413/503 paths, sticky sessions, the
   admin API, panic mode, drain, hedging, health checks, live reconfiguration,
-  WebSocket tunnels with half-close and HTTP/1.0 clients, with the protocol
-  corner cases driven by scripted raw upstreams.
+  WebSocket tunnels with half-close and HTTP/1.0 clients, path and wildcard
+  host routing, 404s with no default pool, cookie pinning and re-pinning,
+  cache hits without the backend (and five kinds of response it must refuse),
+  per-key route limits, an outlier ejected while its breaker stays closed, and
+  slow start after a reload, with the protocol corner cases driven by scripted
+  raw upstreams.
 - **`tests/smoke.sh`** runs the compiled binaries as real processes: the CLI,
   `SIGHUP` reload (including a broken config and command-line overrides), how
   long a `SIGTERM` drain takes, several workers sharing one port, restart after
@@ -690,6 +832,11 @@ Every project has gaps; these are JDblance's:
   network that already encrypts traffic, such as Tailscale/WireGuard.
 - **Metrics are per worker.** With several workers, Prometheus scrapes each
   port and adds them up; counters aren't merged in shared memory.
+- **A deliberately simple cache.** No `Vary` support (such responses aren't
+  stored), no revalidation with `ETag` / `If-Modified-Since`, no `Expires`
+  header, and each worker has its own cache.
+- **Routing is host and prefix only.** No regular expressions, header or
+  method matching, or rewriting beyond stripping the prefix.
 - **No service discovery.** Endpoints come from the config file and the admin
   API. Adding Consul or Kubernetes would mean a watcher that calls
   `Cluster::apply_config`, the same path `SIGHUP` uses.

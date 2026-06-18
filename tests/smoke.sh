@@ -162,7 +162,7 @@ check "loadgen report" grep -q 'corrected for coordinated omission' "$WORK/loadg
 check "loadgen --json, closed loop" bash -c "'$B/jdblance-loadgen' http://127.0.0.1:$LP/ -c 4 -d 0.5 --json | grep -q '\"throughput_rps\"'"
 
 curl -s -X POST "http://127.0.0.1:$O2/chaos?healthy=0" >/dev/null
-check "health checks eject the endpoint" eventually stats_has '"name":"o2","address":"127.0.0.1:'$O2'","weight":1,"healthy":false'
+check "health checks eject the endpoint" eventually stats_has '"name":"o2",[^}]*"healthy":false'
 alertbot --admin "http://127.0.0.1:$AP" --once >"$WORK/alert.txt" 2>&1
 check "alertbot reports it" grep -q 'DOWN: o2' "$WORK/alert.txt"
 TWILIO_ACCOUNT_SID=AC1 TWILIO_AUTH_TOKEN=secret TWILIO_WHATSAPP_NUMBER=a YOUR_WHATSAPP_NUMBER=b \
