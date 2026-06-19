@@ -18,25 +18,35 @@ $ make demo
 
 phase                      rps   errors       p50       p99  distribution
 ------------------------------------------------------------------------------
-1. baseline                300    0.00%      4.8ms      6.2ms  origin0:33%  origin1:24%  origin2:14%  origin3:29%
-2. origin0 fails           300    0.00%      4.8ms      6.2ms  origin1:34%  origin2:25%  origin3:41%
-3. origin1 crawls          300    0.00%      4.7ms      6.1ms  origin2:48%  origin3:52%
-4. origin2 refuses         300    0.00%      4.7ms      6.1ms  origin3:100%
-5. recovery                300    0.00%      4.8ms      6.1ms  origin0:20%  origin2:36%  origin3:44%
+1. baseline                300    0.00%      4.7ms      6.0ms  origin0:30%  origin1:34%  origin2:23%  origin3:13%
+2. origin0 fails           300    0.00%      4.7ms      6.0ms  origin1:41%  origin2:32%  origin3:26%
+3. origin1 crawls          300    0.00%      4.7ms      6.0ms  origin2:49%  origin3:51%
+4. origin2 refuses         300    0.00%      4.6ms      6.0ms  origin3:100%
+5. recovery                300    0.00%      4.7ms      6.1ms  origin0:20%  origin1:3%  origin2:28%  origin3:49%
+6. origin3 flakes          300    0.00%      4.7ms      9.6ms  origin0:39%  origin1:22%  origin2:33%  origin3:6%
 ==============================================================================
 
 worst client-visible error rate across all phases: 0.00% (during '1. baseline')
-...while three of the four origins were, in turn, failing every request, crawling, or refusing connections outright.
+...while every origin, in turn, failed every request, crawled, refused connections outright, or quietly failed one request in four.
 ```
 
 The demo breaks one origin per phase while a steady 300 requests per second
-keep arriving, and every response counts toward the error column. JDblance
-steers traffic around each failure. In row 5, after the faults are cleared,
-origin0 and origin2 are serving again. origin0 is the one that failed every
-request while its health check stayed green, so only the circuit breaker could
-take it out and let it back in. origin1, which was slowed rather than broken,
-is still at 0% when the run ends: its latency estimate is still decaying, and
-P2C sends it work again once it looks cheap enough.
+keep arriving, and every response counts toward the error column:
+
+- **Phase 2:** origin0 fails every request, and its circuit breaker takes it out.
+- **Phase 3:** origin1 slows down by 400 ms, and P2C and hedging move traffic
+  off it with no help from health checks.
+- **Phase 4:** origin2 refuses connections, and retries plus its breaker cover
+  the gap.
+- **Phase 5:** the faults are cleared. origin0 and origin2 come back through
+  slow start, ramping up over 6 s instead of taking a full share at once.
+  origin0 is the one that failed requests while its health check stayed
+  green, so only the breaker could take it out and let it back in. origin1 is
+  still at a few percent, because its latency estimate is still decaying.
+- **Phase 6:** origin3 starts failing one request in four. That is below the
+  breaker's 50% threshold, and retries hide every failure from clients.
+  Outlier detection compares origin3 with its peers, ejects it, and its share
+  drops to 6%.
 
 ---
 
@@ -312,7 +322,7 @@ expensive until it works through them. Multiplying by the in-flight count is
 what keeps the score from swinging back and forth. A backend that has never
 been measured costs nothing while idle, so it always gets tried.
 
-In the demo above, origin1 served 34% of responses in phase 2. Once it was
+In the demo above, origin1 served 41% of responses in phase 2. Once it was
 slowed by 400 ms in phase 3, it served none, with no help from health checks.
 
 ### Sticky routing with Maglev and bounded-load hashing
@@ -586,39 +596,49 @@ makes it usable as a CI check.
 Each run is 5 seconds of open-loop load against four `jdblance-origin`
 backends that take 1 ms per request, with hedging on and access logging off.
 The load generator, proxy and origins all ran on the same 16-vCPU WSL2 VM
-(kernel 5.15), with the Windows host otherwise mostly idle. Every row is the
+(kernel 5.15), with the Windows host idle and on mains power. Every row is the
 median of three runs, and latency is corrected for coordinated omission:
 
 | target rate | workers | actual rate | p50 | p99 | p99.9 | errors |
 |---|---|---|---|---|---|---|
-| 2,000 rps | 1 | 2,019 rps | 1.46 ms | 2.0 ms | 3.1 ms | 0 |
-| 5,000 rps | 1 | 4,986 rps | 1.27 ms | 1.6 ms | 3.2 ms | 0 |
-| 10,000 rps | 1 | 10,021 rps | 1.26 ms | 1.9 ms | 3.2 ms | 0 |
-| 20,000 rps | 1 | 19,993 rps | 1.32 ms | 3.3 ms | 6.5 ms | 0 |
-| 10,000 rps | 4 | 9,969 rps | 1.26 ms | 1.6 ms | 2.4 ms | 0 |
-| 20,000 rps | 4 | 19,938 rps | 1.39 ms | 2.0 ms | 2.7 ms | 0 |
-| 40,000 rps | 4 | 39,960 rps | 1.97 ms | 5.4 ms | 18.3 ms | 0 |
-| 60,000 rps | 4 | 59,543 rps | 8.77 ms | 43.9 ms | 47.4 ms | 0 |
+| 2,000 rps | 1 | 1,989 rps | 1.47 ms | 1.8 ms | 2.0 ms | 0 |
+| 5,000 rps | 1 | 4,980 rps | 1.27 ms | 1.5 ms | 1.8 ms | 0 |
+| 10,000 rps | 1 | 10,009 rps | 1.22 ms | 1.4 ms | 2.3 ms | 0 |
+| 20,000 rps | 1 | 20,014 rps | 1.23 ms | 2.0 ms | 3.3 ms | 0 |
+| 10,000 rps | 4 | 9,997 rps | 1.22 ms | 1.4 ms | 1.6 ms | 0 |
+| 20,000 rps | 4 | 20,038 rps | 1.28 ms | 1.6 ms | 2.7 ms | 0 |
+| 40,000 rps | 4 | 39,968 rps | 1.45 ms | 2.1 ms | 2.9 ms | 0 |
+| 60,000 rps | 4 | 59,881 rps | 1.54 ms | 3.3 ms | 10.5 ms | 0 |
 
-None of these runs returned a single error or 503.
+None of these runs returned a single error or 503, and the three repeats of
+each row agreed closely: the largest single p99 in the table's runs was 4.3 ms.
 
-A single worker saturates at about **23k rps** on this machine: offered 30k,
-40k and 60k rps, it delivered between 19.5k and 23.8k (median 23.1k over nine
-runs), with latency climbing into seconds as requests queue and a handful of
-requests shed with 503. Turning the access log on costs about 4% at the same
-offered loads (median 21.5k against 22.4k, six runs each). Four workers kept
-up with 60k rps; beyond that, the single-threaded load generator and origins
-compete with the proxy for the same 16 vCPUs, so a higher rate wouldn't show
-where the proxy alone stops.
+A single worker saturates at about **30k rps** on this machine. Offered 30k,
+it kept up (p99 under 4 ms in two of three runs). Offered 40k and 60k, it
+delivered between 29.5k and 30.4k (median 30.0k over six runs), with latency
+climbing into seconds as requests queued and six requests shed with 503.
+Turning the access log on lowers that ceiling by about 6% (median 28.3k over
+the same six offered loads). Four workers kept up with 60k rps, which is as
+far as these runs go: the load generator is single-threaded and shares the
+16 vCPUs, so a higher rate would measure it as much as the proxy.
 
-Tail latency varies from run to run even on a quiet machine. Most runs kept
-p99 within a few milliseconds, but one of the three single-worker 20k runs and
-one of the four-worker 40k runs each had a p99 of about 87 ms, and the
-four-worker 60k runs ranged from 20 ms to 155 ms. The medians above smooth
-that out. Treat these numbers as relative, measured on
-one machine. `make compare` sends identical open-loop load to JDblance and to
-the nginx comparison in the Docker stack, so you can measure both on your own
-hardware.
+These numbers depend heavily on the machine being otherwise idle. With a game
+and a browser running on the same Windows host, the same benchmark gave p99s
+of up to 180 ms at 10–20k rps and a single-worker ceiling of 20–23k. To
+reproduce the table, close other applications, keep the machine plugged in,
+and run each row more than once.
+
+Because wall-clock throughput depends on whatever else the machine is doing,
+the cost per request is also measured deterministically: callgrind counts
+**about 64,000 CPU instructions per proxied request** (keep-alive client and
+upstream, hedging on, access log off). That covers parsing the request and
+response heads, routing, backend selection, building the upstream request,
+relaying the response, and metrics. Removing per-request allocations
+(lower-cased header copies, `Connection` token vectors, metric label vectors
+for gauges nobody reads between scrapes) took it from 73,600 to 64,400, a
+12.6% cut. Treat these numbers as relative, measured on one machine.
+`make compare` sends identical open-loop load to JDblance and to the nginx
+comparison in the Docker stack, so you can measure both on your own hardware.
 
 ---
 
@@ -736,9 +756,9 @@ sent upstream in `X-Request-ID`:
  "ms":3.510,"upstream":"backend2","attempts":1,"hedged":false,"rid":"a1b2c3d4e5f60718","w":0}
 ```
 
-Grafana loads its 16-panel dashboard from [`grafana/`](grafana/) on startup,
+Grafana loads its 20-panel dashboard from [`grafana/`](grafana/) on startup,
 so there is nothing to import by hand. [`prometheus/rules.yml`](prometheus/rules.yml)
-has nine alert rules based on what users experience rather than on internal
+has ten alert rules based on what users experience rather than on internal
 causes: one backend being down is a *warning*, since the balancer has already
 routed around it, while more than 5% of client responses failing is a *page*.
 
@@ -845,21 +865,5 @@ Every project has gaps; these are JDblance's:
   the code gives those temporaries names; other compilers haven't been tried.
 
 ---
-
-## Further reading
-
-None of these algorithms are new; JDblance implements published work.
-
-| Topic | Source |
-|---|---|
-| P2C balancing | M. Mitzenmacher, *The Power of Two Choices in Randomized Load Balancing* |
-| Maglev hashing | D. Eisenbud et al., *Maglev: A Fast and Reliable Software Network Load Balancer*, NSDI 2016 |
-| Bounded-load hashing | V. Mirrokni, M. Thorup, M. Zadimoghaddam, *Consistent Hashing with Bounded Loads* |
-| CoDel | K. Nichols, V. Jacobson, *Controlling Queue Delay* |
-| Hedged requests | J. Dean, L. A. Barroso, *The Tail at Scale* |
-| Gradient concurrency limit | Netflix `concurrency-limits` library |
-| Coordinated omission | G. Tene, *How NOT to Measure Latency* |
-| Panic mode, peak EWMA, retry budgets | Envoy and Finagle documentation |
-| HTTP, BLAKE2 | RFC 9110 and RFC 9112; RFC 7693 |
 
 Licensed under MIT; see [LICENSE](LICENSE).

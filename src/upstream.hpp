@@ -67,6 +67,7 @@ class Upstream {
   std::string balancer_signature_;
   std::unique_ptr<Balancer> balancer_;
   PeakEwmaP2C fallback_;   // re-picks after slow start declines the policy's choice
+  bool affinity_ = false;  // a hash policy: exempt from slow start
   std::vector<EndpointPtr> endpoints_;
   double next_outlier_check_ = 0;
   bool built_ = false;

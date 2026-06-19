@@ -4,10 +4,12 @@
 // open-loop traffic, and a timeline of things breaking:
 //
 //   1. baseline          all four healthy
-//   2. origin0 fails     500 for every request
-//   3. origin1 crawls    +400 ms of latency
-//   4. origin2 refuses   listener closed and every connection dropped
-//   5. recovery          faults cleared, origin2 rebound on its old port
+//   2. origin0 fails     500 for every request                 (circuit breaker)
+//   3. origin1 crawls    +400 ms of latency                    (P2C, hedging)
+//   4. origin2 refuses   listener closed, connections dropped  (retries, breaker)
+//   5. recovery          faults cleared, origin2 rebound       (slow start)
+//   6. origin3 flakes    25% of requests fail, below the       (outlier detection)
+//                        breaker's 50% threshold
 //
 // The number that matters is the client-visible error rate per phase.
 #include <algorithm>
@@ -20,6 +22,7 @@
 #include <vector>
 
 #include "http1.hpp"
+#include "metrics.hpp"
 #include "origin.hpp"
 #include "proxy.hpp"
 
@@ -115,8 +118,8 @@ void render(const std::vector<Phase>& phases) {
   }
   std::printf("\nworst client-visible error rate across all phases: %.2f%% (during '%s')\n",
               worst->error_rate() * 100, worst->name.c_str());
-  std::printf("...while three of the four origins were, in turn, failing every request, "
-              "crawling, or refusing connections outright.\n\n");
+  std::printf("...while every origin, in turn, failed every request, crawled, refused connections "
+              "outright, or quietly failed one request in four.\n\n");
 }
 
 Task<void> accept_loop(Proxy* proxy, SocketPtr listener) {
@@ -148,8 +151,9 @@ Task<void> demo(std::vector<std::shared_ptr<Origin>>* origins, Cluster* cluster,
       {"3. origin1 crawls", "+400 ms of latency", [&] { (*origins)[1]->base_latency = 0.4; }, 1.0},
       {"4. origin2 refuses", "listener closed, connections dropped", [&] { (*origins)[2]->close(); }, 1.0},
       // Longer, because recovery is deliberately not instant: health checks
-      // need `rise` passes and a slow backend's EWMA has to decay.
-      {"5. recovery", "faults cleared, origin2 rebound",
+      // need `rise` passes, a slow backend's EWMA has to decay, and slow
+      // start ramps each returning origin up over 6 s.
+      {"5. recovery", "faults cleared, origin2 rebound; returning origins warm up",
        [&] {
          for (auto& o : *origins) {
            o->fail_rate = 0.0;
@@ -159,6 +163,10 @@ Task<void> demo(std::vector<std::shared_ptr<Origin>>* origins, Cluster* cluster,
          (*origins)[2]->listen("127.0.0.1", origin2_port);
        },
        2.0},
+      // Retries hide each failure from the client; outlier detection notices
+      // the pattern and takes origin3 out.
+      {"6. origin3 flakes", "25% of requests fail: too few for the breaker",
+       [&] { (*origins)[3]->fail_rate = 0.25; }, 1.0},
   };
   for (const Script& step : script) {
     if (step.action) step.action();
@@ -197,6 +205,8 @@ int main() {
     "health": {"enabled": true, "interval": 1.0, "fall": 2, "rise": 1},
     "breaker": {"consecutive_failures": 5, "min_requests": 10, "cooldown": 3.0},
     "hedge": {"enabled": true},
+    "slow_start": {"window": 6.0, "min_weight": 0.1},
+    "outlier": {"enabled": true, "interval": 2.0, "min_requests": 10, "base_ejection": 10.0},
     "log": {"access": false}
   })");
   data["endpoints"] = endpoints;
@@ -215,9 +225,10 @@ int main() {
   render(phases);
   for (const EndpointPtr& e : cluster.endpoints()) {
     Json s = e->snapshot();
-    std::printf("  %-10s requests=%-7s failures=%-5s breaker=%-10s ewma=%sms\n", e->name.c_str(),
-                format_number(s.find("requests")->as_number()).c_str(),
+    std::printf("  %-10s requests=%-7s failures=%-5s breaker=%-10s outlier ejections=%-3s ewma=%sms\n",
+                e->name.c_str(), format_number(s.find("requests")->as_number()).c_str(),
                 format_number(s.find("failures")->as_number()).c_str(), e->breaker.state_name(),
+                format_number(metrics::OUTLIER_EJECTIONS.value({e->name})).c_str(),
                 format_number(s.find("ewma_ms")->as_number()).c_str());
   }
   std::printf("\n");

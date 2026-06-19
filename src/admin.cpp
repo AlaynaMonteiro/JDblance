@@ -120,6 +120,8 @@ AdminServer::Reply AdminServer::route(const http::Request& req) {
   if (method == "GET" || method == "HEAD") {
     if (path == "/") return {200, kDashboardHtml, "text/html; charset=utf-8"};
     if (path == "/metrics") {
+      double now = monotonic();
+      for (const EndpointPtr& e : cluster_.endpoints()) e->publish_gauges(now);
       return {200, metrics::registry().render(), "text/plain; version=0.0.4; charset=utf-8"};
     }
     if (path == "/healthz") return {200, "{\"status\":\"ok\"}\n", kJson};

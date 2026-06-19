@@ -58,6 +58,16 @@ groups:
           summary: "Circuit breaker open for {{ $labels.endpoint }}"
           description: "Ejected by passive failure detection, not by health checks."
 
+      - alert: JDblanceOutlierEjected
+        expr: increase(jdblance_outlier_ejections_total[5m]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.endpoint }} was ejected as an outlier"
+          description: >-
+            Its success rate fell far below its peers' while staying under the
+            breaker's own thresholds: a partial failure the rest of the fleet
+            is absorbing.
+
       - alert: JDblanceSheddingLoad
         expr: sum(rate(jdblance_shed_total[2m])) > 1
         for: 2m

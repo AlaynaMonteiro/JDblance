@@ -598,6 +598,12 @@ Task<void> admin_scenario(Stack* s, AdminServer* admin) {
   CHECK(m.body.find("jdblance_requests_total") != std::string::npos);
   CHECK(m.body.find("jdblance_endpoint_up{endpoint=\"b0\"} 1") != std::string::npos);
   CHECK(m.body.find("app_requests_total") == std::string::npos);   // origins keep their own registry
+  // Rare-event counters exist at 0 before the first event, or increase()
+  // never sees the first one (the outlier panel and alert stayed silent).
+  CHECK(m.body.find("jdblance_outlier_ejections_total{endpoint=\"b1\"} 0") != std::string::npos);
+  CHECK(m.body.find("jdblance_endpoint_ejections_total{endpoint=\"b1\"} 0") != std::string::npos);
+  // Per-endpoint gauges are published at scrape time.
+  CHECK(m.body.find("jdblance_endpoint_in_flight{endpoint=\"b0\"} 0") != std::string::npos);
 
   st = co_await status_of(ap, "/endpoints/nope/drain", "POST");
   CHECK_EQ(st, 404);

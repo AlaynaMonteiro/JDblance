@@ -167,6 +167,9 @@ class Endpoint {
   double load_score(double now = monotonic(), double default_latency = 0.005) const;
 
   void add_inflight(int delta);
+  // In-flight, EWMA, breaker state and idle connections are only read when
+  // /metrics is scraped, so they are set then rather than on every request.
+  void publish_gauges(double now = monotonic());
 
   struct Conn {
     SocketPtr socket;

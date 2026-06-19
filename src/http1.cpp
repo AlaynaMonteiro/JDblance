@@ -141,8 +141,16 @@ std::vector<std::string> Message::connection_tokens() const {
 }
 
 bool Message::connection_has(std::string_view token) const {
-  for (const auto& t : connection_tokens()) {
-    if (t == token) return true;
+  // Asked several times per request: scan in place, no token vector.
+  for (const auto& [k, v] : headers) {
+    if (!iequals(k, "connection")) continue;
+    std::string_view rest = v;
+    for (;;) {
+      size_t comma = rest.find(',');
+      if (iequals(trim(rest.substr(0, comma)), token)) return true;
+      if (comma == std::string_view::npos) break;
+      rest.remove_prefix(comma + 1);
+    }
   }
   return false;
 }
@@ -420,9 +428,13 @@ Headers filtered_headers(const Message& msg, const std::vector<std::string_view>
   Headers out;
   out.reserve(msg.headers.size());
   for (const auto& h : msg.headers) {
-    std::string lowered = to_lower(h.first);
+    // Case-insensitive compare in place: lower-casing a copy of every header
+    // name cost an allocation per header, twice per proxied request.
     auto in = [&](const auto& list) {
-      return std::find(list.begin(), list.end(), lowered) != list.end();
+      for (const auto& name : list) {
+        if (iequals(h.first, name)) return true;
+      }
+      return false;
     };
     if (in(kHopByHop) || in(named) || in(drop)) continue;
     out.push_back(h);

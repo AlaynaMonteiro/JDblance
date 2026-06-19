@@ -30,6 +30,7 @@ void Upstream::apply(const UpstreamConfig& spec, const Config& cfg,
   if (signature != balancer_signature_) {
     balancer_ = build_balancer(spec.policy, cfg.vnodes, cfg.bounded_load_factor, cfg.maglev_table_size);
     balancer_signature_ = signature;
+    affinity_ = dynamic_cast<HashBalancer*>(balancer_.get()) != nullptr;
   }
 
   double now = monotonic();
@@ -101,7 +102,7 @@ EndpointPtr Upstream::select(const std::optional<std::string>& key, const std::v
       if (e->sticky_token() == preferred && (panic || e->breaker.allow(now))) return e;
     }
   }
-  bool affinity = dynamic_cast<HashBalancer*>(balancer_.get()) != nullptr;
+  bool affinity = affinity_;
   bool declined = false;
   while (!pool.empty()) {
     // Once slow start has turned the policy's choice down, the replacement

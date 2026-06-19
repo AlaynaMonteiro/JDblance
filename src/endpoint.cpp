@@ -295,14 +295,12 @@ void Endpoint::observe_latency(double seconds, double now) {
     ewma_ = ewma_ * decay + seconds * (1.0 - decay);
   }
   ewma_stamp_ = now;
-  metrics::ENDPOINT_EWMA.set({name}, ewma_);
 }
 
 void Endpoint::observe_lower_bound(double seconds, double now) {
   if (seconds <= ewma(now)) return;
   ewma_ = seconds;
   ewma_stamp_ = now;
-  metrics::ENDPOINT_EWMA.set({name}, ewma_);
 }
 
 double Endpoint::load_score(double now, double default_latency) const {
@@ -320,18 +318,20 @@ double Endpoint::load_score(double now, double default_latency) const {
   return latency * (inflight + 1) / weight;
 }
 
-void Endpoint::add_inflight(int delta) {
-  inflight += delta;
+void Endpoint::add_inflight(int delta) { inflight += delta; }
+
+void Endpoint::publish_gauges(double now) {
   metrics::ENDPOINT_INFLIGHT.set({name}, inflight);
+  metrics::ENDPOINT_EWMA.set({name}, ewma(now));
+  metrics::ENDPOINT_BREAKER.set({name}, static_cast<double>(breaker.state()));
+  metrics::POOL_IDLE.set({name}, static_cast<double>(pool.size()));
 }
 
 Task<Endpoint::Conn> Endpoint::connect(double timeout) {
   if (SocketPtr pooled = pool.acquire()) {
     metrics::POOL_REUSED.inc({name});
-    metrics::POOL_IDLE.set({name}, static_cast<double>(pool.size()));
     co_return Conn{std::move(pooled), true};
   }
-  metrics::POOL_IDLE.set({name}, static_cast<double>(pool.size()));
   double deadline = monotonic() + timeout;
   if (addresses_.empty() || monotonic() - resolved_at_ > kResolveTtl) {
     std::vector<Address> fresh = co_await resolve(host, port, deadline);
@@ -355,7 +355,6 @@ void Endpoint::release(SocketPtr socket, bool reusable) {
   } else if (socket) {
     socket->close();
   }
-  metrics::POOL_IDLE.set({name}, static_cast<double>(pool.size()));
 }
 
 void Endpoint::record(bool success, int status, const std::string& error) {
@@ -366,7 +365,6 @@ void Endpoint::record(bool success, int status, const std::string& error) {
   }
   last_status = status;
   if (breaker.record(success)) metrics::ENDPOINT_EJECTIONS.inc({name});
-  metrics::ENDPOINT_BREAKER.set({name}, static_cast<double>(breaker.state()));
 }
 
 Json Endpoint::snapshot() {

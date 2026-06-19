@@ -88,6 +88,11 @@ void Cluster::apply_config(const Config& cfg) {
     metrics::ENDPOINT_UP.set({e->name}, e->healthy ? 1 : 0);
     metrics::ENDPOINT_BREAKER.set({e->name}, static_cast<double>(e->breaker.state()));
     metrics::ENDPOINT_INFLIGHT.set({e->name}, e->inflight);
+    // Rare-event counters must exist at 0 before their first event: a series
+    // that first appears at 1 is invisible to increase(), so the first
+    // ejection would never show on the dashboard or fire its alert.
+    metrics::ENDPOINT_EJECTIONS.inc({e->name}, 0);
+    metrics::OUTLIER_EJECTIONS.inc({e->name}, 0);
   }
 
   // Routes: a survivor with the same limit keeps its buckets.
@@ -958,10 +963,12 @@ Task<Proxy::RelayOutcome> Proxy::relay_response(ClientConn& conn, const http::Re
     if (fresh && framing.length > cluster_.cache.max_object_bytes()) fresh.reset();
   }
   if (cfg_.debug_headers) {
-    char took[32];
-    std::snprintf(took, sizeof took, "%.2fms", ex.elapsed * 1000.0);
+    // "%.2fms" without printf's floating-point machinery, once per response.
+    long long hundredths = std::llround(ex.elapsed * 1e5);
+    std::string took = std::to_string(hundredths / 100) + "." + static_cast<char>('0' + hundredths / 10 % 10) +
+                       static_cast<char>('0' + hundredths % 10) + "ms";
     headers.emplace_back("X-Upstream", ex.endpoint->name);
-    headers.emplace_back("X-Upstream-Time", took);
+    headers.emplace_back("X-Upstream-Time", std::move(took));
     if (attempts > 1) headers.emplace_back("X-Attempts", std::to_string(attempts));
     if (hedged) headers.emplace_back("X-Hedged", "1");
     if (!extras.cache_key.empty()) headers.emplace_back("X-Cache", "MISS");

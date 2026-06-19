@@ -31,6 +31,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -427,6 +428,29 @@ class IncompleteRead : public std::runtime_error {
   IncompleteRead() : std::runtime_error("incomplete read") {}
 };
 
+// Allocator whose value-initialisation is default-initialisation, so sizing a
+// byte buffer does not zero memory that read() is about to overwrite.  A
+// BufReader is created per upstream attempt; zeroing its 8 KiB every time
+// was measurable.
+template <typename T>
+struct UninitAllocator : std::allocator<T> {
+  template <typename U>
+  struct rebind {
+    using other = UninitAllocator<U>;
+  };
+  UninitAllocator() = default;
+  template <typename U>
+  UninitAllocator(const UninitAllocator<U>&) noexcept {}
+  template <typename U>
+  void construct(U* p) noexcept(std::is_nothrow_default_constructible_v<U>) {
+    ::new (static_cast<void*>(p)) U;
+  }
+  template <typename U, typename... Args>
+  void construct(U* p, Args&&... args) {
+    ::new (static_cast<void*>(p)) U(std::forward<Args>(args)...);
+  }
+};
+
 class BufReader {
  public:
   explicit BufReader(SocketPtr socket);
@@ -445,7 +469,7 @@ class BufReader {
  private:
   Task<bool> fill(double deadline);
   SocketPtr socket_;
-  std::vector<char> buf_;
+  std::vector<char, UninitAllocator<char>> buf_;
   size_t start_ = 0;
   size_t end_ = 0;
   bool eof_ = false;
